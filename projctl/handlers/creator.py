@@ -205,12 +205,109 @@ class EpicIssueCreator:
         """
         validate_labels(labels, self.config.get_allowed_labels())
 
-    def _build_issue_cmd(self, issue_config: Dict[str, Any], all_labels: List[str]) -> List[str]:
-        """Build the glab command list for creating an issue.
+    def _fetch_group_labels(self) -> Dict[str, int]:
+        """Fetch all group-level labels and return a name→ID map (cached per instance).
+
+        Group labels are yellow in the GitLab UI; project labels are blue. Passing
+        label IDs instead of names ensures GitLab uses the group-scoped label rather
+        than auto-creating a new project-scoped one when the name is not found locally.
+
+        Returns:
+            Dict mapping lowercase label name to numeric label ID. Empty dict if the
+            group is not configured or the API call fails.
+        """
+        if hasattr(self, "_group_label_cache"):
+            return self._group_label_cache  # type: ignore[return-value]
+
+        cache: Dict[str, int] = {}
+        if not self.group:
+            self._group_label_cache = cache
+            return cache
+
+        encoded_group = urllib.parse.quote(self.group, safe="")
+        page = 1
+        while True:
+            try:
+                output = self._run_glab_command(
+                    ["api", f"groups/{encoded_group}/labels?per_page=100&page={page}"]
+                )
+                if not output:
+                    break
+                labels = json.loads(output)
+                if not labels:
+                    break
+                for label in labels:
+                    cache[label["name"].lower()] = label["id"]
+                if len(labels) < 100:
+                    break
+                page += 1
+            except (PlatformError, json.JSONDecodeError) as err:
+                logger.warning("Failed to fetch group labels (page %s): %s", page, err)
+                break
+
+        logger.debug("Fetched %s group labels", len(cache))
+        self._group_label_cache = cache
+        return cache
+
+    def _apply_labels_by_id(
+        self, issue_url: str, issue_iid: str, label_names: List[str]
+    ) -> None:
+        """Apply labels to an issue using group label IDs to avoid project-label creation.
+
+        Resolves each label name against the group label cache. Labels not found in the
+        group are applied by name as a fallback (they may create project labels, but
+        that is acceptable for genuinely project-local labels).
+
+        Args:
+            issue_url: Issue URL used to derive the project path.
+            issue_iid: Project-scoped issue IID.
+            label_names: List of label names to apply.
+        """
+        if not label_names:
+            return
+
+        project_path, _ = parse_issue_url(issue_url)
+        if not project_path:
+            logger.warning("Cannot apply labels by ID: unable to parse project path from %s", issue_url)
+            return
+
+        group_labels = self._fetch_group_labels()
+        label_ids = []
+        fallback_names = []
+        for name in label_names:
+            label_id = group_labels.get(name.lower())
+            if label_id is not None:
+                label_ids.append(label_id)
+            else:
+                fallback_names.append(name)
+                logger.debug("Label '%s' not found in group; will apply by name", name)
+
+        encoded_project = urllib.parse.quote(project_path, safe="")
+        api_endpoint = f"projects/{encoded_project}/issues/{issue_iid}"
+        cmd = ["api", "-X", "PUT", api_endpoint]
+        for lid in label_ids:
+            cmd.extend(["-f", f"label_ids[]={lid}"])
+        for name in fallback_names:
+            cmd.extend(["-f", f"labels={name}"])
+
+        try:
+            self._run_glab_command(cmd)
+            logger.debug(
+                "Applied %s label(s) by ID and %s by name to issue #%s",
+                len(label_ids), len(fallback_names), issue_iid,
+            )
+        except PlatformError as err:
+            logger.warning("Failed to apply labels to issue #%s: %s", issue_iid, err)
+
+    def _build_issue_cmd(self, issue_config: Dict[str, Any]) -> List[str]:
+        """Build the glab command list for creating an issue (without labels).
+
+        Labels are intentionally omitted here and applied separately via
+        _apply_labels_by_id so that group-scoped label IDs are used, preventing
+        GitLab from auto-creating project-level duplicates.
 
         Args:
             issue_config: Issue configuration dictionary.
-            all_labels: Already-merged and deduplicated labels to apply.
 
         Returns:
             Command list ready to pass to _run_glab_command.
@@ -218,8 +315,6 @@ class EpicIssueCreator:
         cmd = ["issue", "create", "--title", issue_config["title"]]
         if "description" in issue_config:
             cmd.extend(["--description", issue_config["description"]])
-        if all_labels:
-            cmd.extend(["--label", ",".join(all_labels)])
         if "assignee" in issue_config:
             cmd.extend(["--assignee", issue_config["assignee"]])
         if "milestone" in issue_config:
@@ -280,7 +375,9 @@ class EpicIssueCreator:
         # Validate required OR groups — exactly one label per group must be present
         validate_required_label_groups(all_labels, self.config.get_required_label_groups())
 
-        cmd = self._build_issue_cmd(issue_config, all_labels)
+        # Create the issue without labels first; labels are applied separately via
+        # label IDs so that group-scoped labels are used (not project-level duplicates).
+        cmd = self._build_issue_cmd(issue_config)
         output = self._run_glab_command(cmd)
 
         if self.dry_run:
@@ -301,6 +398,10 @@ class EpicIssueCreator:
         logger.info("Created issue: %s", issue_url)
         # Extract iid from the created issue for dependency tracking
         issue_iid = self._extract_issue_iid_from_url(issue_url)
+
+        # Apply labels via group label IDs to avoid creating project-level duplicates.
+        if all_labels:
+            self._apply_labels_by_id(issue_url, issue_iid, all_labels)
 
         # Set weight via API when provided (glab issue create does not support weight as a flag)
         if "weight" in issue_config:
