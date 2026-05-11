@@ -13,6 +13,7 @@ from ..formatters import (
     print_issue,
     print_milestone,
     print_mr,
+    print_mr_comments,
 )
 from ..utils.git_helpers import extract_path_from_url, parse_issue_url
 from ..utils.glab_runner import run_glab_command
@@ -824,6 +825,19 @@ class TicketLoader:
             data.get("epic_map", {}),
         )
 
+    def _normalize_mr_ref(self, mr_ref: str) -> str:
+        """Strip ! prefix and URL-decode an MR reference to a bare integer string."""
+        if mr_ref.startswith("!"):
+            mr_ref = mr_ref[1:]
+        if "://" in mr_ref:
+            if "/-/merge_requests/" in mr_ref:
+                mr_ref = mr_ref.split("/-/merge_requests/")[-1].split("/")[0].split("?")[0]
+            else:
+                raise ValueError(f"Invalid MR URL format: {mr_ref}")
+        if not mr_ref.isdigit():
+            raise ValueError(f"Invalid MR reference: {mr_ref}")
+        return mr_ref
+
     def load_mr(self, mr_ref: str, project: Optional[str] = None) -> Dict[str, Any]:
         """Load merge request information from GitLab.
 
@@ -838,34 +852,68 @@ class TicketLoader:
         Raises:
             PlatformError: If loading fails.
         """
-        # Remove ! prefix if present
-        if mr_ref.startswith("!"):
-            mr_ref = mr_ref[1:]
-
-        # Parse URL if provided
-        if "://" in mr_ref:
-            # Extract MR number from URL
-            # Format: https://gitlab.../group/project/-/merge_requests/123
-            if "/-/merge_requests/" in mr_ref:
-                mr_ref = mr_ref.split("/-/merge_requests/")[-1].split("/")[0].split("?")[0]
-            else:
-                raise ValueError(f"Invalid MR URL format: {mr_ref}")
-
-        if not mr_ref.isdigit():
-            raise ValueError(f"Invalid MR reference: {mr_ref}")
-
+        mr_ref = self._normalize_mr_ref(mr_ref)
         logger.debug("Loading MR !%s (project=%s)", mr_ref, project)
-        # Use glab mr view command
         cmd = ["mr", "view", mr_ref, "--output", "json"]
         output = self._run_glab_command(cmd)
         mr_data = json.loads(output)
-
         return {"mr": mr_data}
 
-    def print_mr_info(self, data: Dict[str, Any]) -> None:
+    def load_mr_comments(self, mr_ref: str) -> Dict[str, Any]:
+        """Load MR metadata and non-system review comments (notes/discussions).
+
+        Filters out system notes (auto-merge, reviewer assignments, etc.) and returns
+        only human-authored comments, preserving discussion threading and inline position.
+
+        Args:
+            mr_ref: MR reference (number, URL, or !number format).
+
+        Returns:
+            Dictionary with keys ``mr`` (metadata) and ``comments`` (list of dicts with
+            keys: id, author, body, resolvable, resolved, file_path, line).
+
+        Raises:
+            PlatformError: If loading fails.
+        """
+        mr_ref = self._normalize_mr_ref(mr_ref)
+        logger.debug("Loading MR !%s comments", mr_ref)
+
+        mr_data = json.loads(self._run_glab_command(["mr", "view", mr_ref, "--output", "json"]))
+        raw_discussions = json.loads(
+            self._run_glab_command(["mr", "note", "list", mr_ref, "--output", "json"])
+        )
+
+        comments: List[Dict[str, Any]] = []
+        for discussion in raw_discussions:
+            for note in discussion.get("notes", []):
+                if note.get("system"):
+                    continue
+                body = note.get("body", "").strip()
+                if not body:
+                    continue
+                position = note.get("position") or {}
+                comments.append(
+                    {
+                        "id": note["id"],
+                        "author": note.get("author", {}).get("name", "Unknown"),
+                        "body": body,
+                        "resolvable": note.get("resolvable", False),
+                        "resolved": note.get("resolved", False),
+                        "file_path": position.get("new_path", ""),
+                        "line": position.get("new_line", ""),
+                        "created_at": note.get("created_at", ""),
+                    }
+                )
+
+        return {"mr": mr_data, "comments": comments}
+
+    def print_mr_info(self, data: Dict[str, Any], with_comments: bool = False) -> None:
         """Print merge request information in markdown format.
 
         Args:
-            data: Dictionary containing MR data.
+            data: Dictionary containing MR data (and optionally comments).
+            with_comments: When True, also prints review comments.
         """
         print_mr(data["mr"])
+        if with_comments and "comments" in data:
+            print_mr_comments(data["comments"])

@@ -288,3 +288,37 @@ def print_mr(mr: Dict[str, Any]) -> None:
     description = mr.get("description", "No description")
     print(description if description else "*No description*")
     print()
+
+
+def print_mr_comments(comments: List[Dict[str, Any]]) -> None:
+    """Print MR review comments grouped by open/resolved in markdown format."""
+    if not comments:
+        print("## Review Comments\n\n*No review comments.*\n")
+        return
+
+    open_comments = [c for c in comments if not c.get("resolved")]
+    resolved_comments = [c for c in comments if c.get("resolved")]
+
+    def _print_comment(comment: Dict[str, Any]) -> None:
+        author = comment.get("author", "Unknown")
+        file_path = comment.get("file_path", "")
+        line = comment.get("line", "")
+        location = f" — `{file_path}:{line}`" if file_path else ""
+        resolvable = comment.get("resolvable", False)
+        resolved = comment.get("resolved", False)
+        status = " ✅" if resolved else (" 🔴" if resolvable else "")
+        print(f"**{author}**{location}{status}\n")
+        print(comment.get("body", ""))
+        print()
+
+    if open_comments:
+        print(f"## Review Comments — Open ({len(open_comments)})\n")
+        for comment in open_comments:
+            print("---\n")
+            _print_comment(comment)
+
+    if resolved_comments:
+        print(f"## Review Comments — Resolved ({len(resolved_comments)})\n")
+        for comment in resolved_comments:
+            print("---\n")
+            _print_comment(comment)

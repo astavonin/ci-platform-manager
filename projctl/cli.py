@@ -88,16 +88,23 @@ def _dispatch_github_load(loader: GithubLoader, resource_type: str, reference: s
         loader.load_issue(reference)
 
 
-def _dispatch_load(loader: TicketLoader, resource_type: str, reference: str) -> None:
+def _dispatch_load(
+    loader: TicketLoader, resource_type: str, reference: str, comments: bool = False
+) -> None:
     """Dispatch a load + print call based on resource type.
 
     Args:
         loader: The TicketLoader instance.
         resource_type: One of "mr", "epic", "milestone", "issue".
         reference: The resource reference string.
+        comments: When True and resource_type is "mr", also fetch and print review comments.
     """
     if resource_type == "mr":
-        loader.print_mr_info(loader.load_mr(reference))
+        if comments:
+            data = loader.load_mr_comments(reference)
+        else:
+            data = loader.load_mr(reference)
+        loader.print_mr_info(data, with_comments=comments)
     elif resource_type == "epic":
         loader.print_epic_info(loader.load_epic_with_issues(reference))
     elif resource_type == "milestone":
@@ -124,7 +131,12 @@ def cmd_load(args) -> int:
             _dispatch_github_load(gh_loader, args.resource_type, args.reference)
         else:
             loader = TicketLoader(config=config)
-            _dispatch_load(loader, args.resource_type, args.reference)
+            _dispatch_load(
+                loader,
+                args.resource_type,
+                args.reference,
+                comments=getattr(args, "comments", False),
+            )
         return 0
     except FileNotFoundError as err:
         logger.error(str(err))
@@ -623,6 +635,12 @@ Examples:
             "Resource reference: number, URL, #number (issue), "
             "&number (epic), or %%number (milestone)"
         ),
+    )
+    p.add_argument(
+        "--comments",
+        action="store_true",
+        default=False,
+        help="Also load and display review comments (MR only)",
     )
 
 
