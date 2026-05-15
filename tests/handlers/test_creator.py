@@ -120,14 +120,20 @@ class TestCreateIssue:
 
         creator.create_issue(issue_config, epic_id=None)
 
-        # First call: glab issue create; second call: glab api PUT (set weight)
-        assert mock_run.call_count == 2
+        # Calls: (0) glab issue create, (1) glab api PUT labels, (2) glab api PUT weight
+        assert mock_run.call_count == 3
         create_args = mock_run.call_args_list[0][0][0]
         assert create_args[0] == "glab"
         assert "issue" in create_args
         assert "create" in create_args
 
-        weight_args = mock_run.call_args_list[1][0][0]
+        label_args = mock_run.call_args_list[1][0][0]
+        assert "api" in label_args
+        assert "-X" in label_args
+        assert "PUT" in label_args
+        assert any("labels=" in a for a in label_args)
+
+        weight_args = mock_run.call_args_list[2][0][0]
         assert "api" in weight_args
         assert "-X" in weight_args
         assert "PUT" in weight_args
@@ -162,8 +168,8 @@ class TestCreateIssue:
         assert "--milestone" in create_args
         assert "v1.0" in create_args
 
-        # Weight is set via a separate PUT API call
-        weight_args = mock_run.call_args_list[1][0][0]
+        # Labels applied via PUT (call 1), weight via PUT (call 2)
+        weight_args = mock_run.call_args_list[2][0][0]
         assert any("weight=2" in a for a in weight_args)
 
     @patch("subprocess.run")

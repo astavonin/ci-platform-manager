@@ -40,6 +40,7 @@ class EpicIssueCreator:
         self.dry_run = dry_run
         self.created_issues: List[Dict[str, str]] = []
         self.issue_id_mapping: Dict[str, Dict[str, str]] = {}  # yaml_id -> {'iid': ..., 'url': ...}
+        self._group_label_cache: Optional[Dict[str, int]] = None
 
     def _run_glab_command(self, cmd: List[str]) -> str:
         """Run a glab command, skipping execution in dry-run mode.
@@ -94,17 +95,10 @@ class EpicIssueCreator:
                 "Please set 'default_group' in your glab_config.yaml file."
             )
 
-        # Merge default epic labels from config with epic-specific labels
         default_labels = self.config.get_default_epic_labels()
         epic_labels = epic_config.get("labels", [])
-
-        # Combine and deduplicate labels
         all_labels = list(dict.fromkeys(default_labels + epic_labels))
-
-        # Validate labels against allowed list (if configured)
-        self._validate_issue_labels(all_labels)  # Reuse validation logic
-
-        # Validate epic description against required sections
+        self._validate_issue_labels(all_labels)
         validate_issue_description(
             description=description,
             required_sections=self.config.get_required_epic_sections(),
@@ -216,8 +210,8 @@ class EpicIssueCreator:
             Dict mapping lowercase label name to numeric label ID. Empty dict if the
             group is not configured or the API call fails.
         """
-        if hasattr(self, "_group_label_cache"):
-            return self._group_label_cache  # type: ignore[return-value]
+        if self._group_label_cache is not None:
+            return self._group_label_cache
 
         cache: Dict[str, int] = {}
         if not self.group:
@@ -249,14 +243,17 @@ class EpicIssueCreator:
         self._group_label_cache = cache
         return cache
 
-    def _apply_labels_by_id(
-        self, issue_url: str, issue_iid: str, label_names: List[str]
-    ) -> None:
-        """Apply labels to an issue using group label IDs to avoid project-label creation.
+    def _apply_labels(self, issue_url: str, issue_iid: str, label_names: List[str]) -> None:
+        """Apply labels to a newly created issue.
 
-        Resolves each label name against the group label cache. Labels not found in the
-        group are applied by name as a fallback (they may create project labels, but
-        that is acceptable for genuinely project-local labels).
+        Uses the REST API ``labels`` field (comma-separated names) rather than
+        ``label_ids[]``. The GitLab REST API resolves label names against group-level
+        labels before project-level ones, so group-scoped labels are used without
+        creating project-level duplicates — the same behavior as the updater path.
+
+        Passing multiple ``-f labels=name`` arguments is wrong: each overrides the
+        previous and only the last label survives. All names must be joined into a
+        single comma-separated value.
 
         Args:
             issue_url: Issue URL used to derive the project path.
@@ -268,34 +265,16 @@ class EpicIssueCreator:
 
         project_path, _ = parse_issue_url(issue_url)
         if not project_path:
-            logger.warning("Cannot apply labels by ID: unable to parse project path from %s", issue_url)
+            logger.warning("Cannot apply labels: unable to parse project path from %s", issue_url)
             return
-
-        group_labels = self._fetch_group_labels()
-        label_ids = []
-        fallback_names = []
-        for name in label_names:
-            label_id = group_labels.get(name.lower())
-            if label_id is not None:
-                label_ids.append(label_id)
-            else:
-                fallback_names.append(name)
-                logger.debug("Label '%s' not found in group; will apply by name", name)
 
         encoded_project = urllib.parse.quote(project_path, safe="")
         api_endpoint = f"projects/{encoded_project}/issues/{issue_iid}"
-        cmd = ["api", "-X", "PUT", api_endpoint]
-        for lid in label_ids:
-            cmd.extend(["-f", f"label_ids[]={lid}"])
-        for name in fallback_names:
-            cmd.extend(["-f", f"labels={name}"])
+        cmd = ["api", "-X", "PUT", api_endpoint, "-f", f"labels={','.join(label_names)}"]
 
         try:
             self._run_glab_command(cmd)
-            logger.debug(
-                "Applied %s label(s) by ID and %s by name to issue #%s",
-                len(label_ids), len(fallback_names), issue_iid,
-            )
+            logger.debug("Applied %s label(s) to issue #%s", len(label_names), issue_iid)
         except PlatformError as err:
             logger.warning("Failed to apply labels to issue #%s: %s", issue_iid, err)
 
@@ -303,8 +282,8 @@ class EpicIssueCreator:
         """Build the glab command list for creating an issue (without labels).
 
         Labels are intentionally omitted here and applied separately via
-        _apply_labels_by_id so that group-scoped label IDs are used, preventing
-        GitLab from auto-creating project-level duplicates.
+        _apply_labels so that group-scoped labels are resolved correctly,
+        preventing GitLab from auto-creating project-level duplicates.
 
         Args:
             issue_config: Issue configuration dictionary.
@@ -357,22 +336,16 @@ class EpicIssueCreator:
         if required_fields:
             logger.debug("Issue '%s': required fields validated: %s", title, required_fields)
 
-        # Validate required sections in description
         self._validate_issue_description(issue_config)
 
         yaml_id = issue_config.get("id")
         id_suffix = f" (id: {yaml_id})" if yaml_id else ""
         logger.info("Creating issue: %s%s", title, id_suffix)
 
-        # Merge default labels from config with issue-specific labels
         all_labels = list(
             dict.fromkeys(self.config.get_default_labels() + issue_config.get("labels", []))
         )
-
-        # Validate labels against allowed list (if configured)
         self._validate_issue_labels(all_labels)
-
-        # Validate required OR groups — exactly one label per group must be present
         validate_required_label_groups(all_labels, self.config.get_required_label_groups())
 
         # Create the issue without labels first; labels are applied separately via
@@ -393,25 +366,19 @@ class EpicIssueCreator:
             self.created_issues.append(issue_info)
             return issue_url
 
-        # Extract issue URL/ID from output
         issue_url = self._extract_issue_id(output)
         logger.info("Created issue: %s", issue_url)
-        # Extract iid from the created issue for dependency tracking
         issue_iid = self._extract_issue_iid_from_url(issue_url)
 
-        # Apply labels via group label IDs to avoid creating project-level duplicates.
         if all_labels:
-            self._apply_labels_by_id(issue_url, issue_iid, all_labels)
+            self._apply_labels(issue_url, issue_iid, all_labels)
 
-        # Set weight via API when provided (glab issue create does not support weight as a flag)
         if "weight" in issue_config:
             self._set_issue_weight(issue_url, issue_iid, issue_config["weight"])
 
-        # Track the yaml_id mapping for dependency linking
         if yaml_id:
             self.issue_id_mapping[yaml_id] = {"url": issue_url, "iid": issue_iid}
             logger.debug("Mapped YAML ID '%s' to issue #%s", yaml_id, issue_iid)
-        # Link to epic if provided
         if epic_id:
             self._link_issue_to_epic(issue_url, epic_id)
 
@@ -771,7 +738,6 @@ class EpicIssueCreator:
                 "YAML must contain at least one of: 'milestone', 'epic', or 'issues' sections"
             )
 
-        # Create milestone first when present
         if has_milestone:
             milestone_config = config["milestone"]
             if "title" not in milestone_config:
@@ -784,7 +750,6 @@ class EpicIssueCreator:
             print(f"Created milestone %{result['iid']}: {milestone_config['title']}")
             print(f"URL: {result['web_url']}")
 
-        # Create epic + issues when both are present
         if has_epic and has_issues:
             # Create or get epic
             epic_config = config["epic"]
