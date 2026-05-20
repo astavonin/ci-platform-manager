@@ -89,8 +89,8 @@ def _load_review_data(review_file: str) -> tuple:
     with open(review_file, "r", encoding="utf-8") as yaml_file:
         review_data = yaml.safe_load(yaml_file)
 
-    if "findings" not in review_data:
-        raise ValueError("Review YAML must contain 'findings' field")
+    if "findings" not in review_data and "replies" not in review_data:
+        raise ValueError("Review YAML must contain 'findings' or 'replies' field")
 
     return review_data, review_data.get("mr_number")
 
@@ -144,6 +144,94 @@ def _fetch_existing_note_bodies(mr_number: int) -> set:
     except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as err:
         logger.warning("Could not fetch existing notes for deduplication: %s", err)
         return set()
+
+
+def _fetch_discussion_note_bodies(mr_number: int, discussion_id: str) -> set:
+    """Fetch note bodies from a specific discussion thread for deduplication."""
+    cmd = [
+        "glab", "api",
+        f"projects/:id/merge_requests/{mr_number}/discussions/{discussion_id}",
+        "--method", "GET",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        disc = json.loads(result.stdout)
+        return {note["body"] for note in disc.get("notes", []) if isinstance(note, dict)}
+    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as err:
+        logger.warning("Could not fetch discussion %s notes: %s", discussion_id[:12], err)
+        return set()
+
+
+def _post_discussion_reply(
+    mr_number: int,
+    discussion_id: str,
+    body: str,
+    dry_run: bool,
+) -> Optional[bool]:
+    """Post a reply note to an existing MR discussion thread.
+
+    Args:
+        mr_number: The MR iid.
+        discussion_id: Full GitLab discussion SHA.
+        body: Reply text.
+        dry_run: If True, only print what would be done.
+
+    Returns:
+        True if posted, None if skipped (already exists), False on failure.
+    """
+    existing = _fetch_discussion_note_bodies(mr_number, discussion_id)
+    if body.strip() in {b.strip() for b in existing}:
+        logger.info("Skipping already-posted reply in discussion %s", discussion_id[:12])
+        return None
+
+    if dry_run:
+        print(f"\n[DRY RUN] Would reply to discussion {discussion_id[:12]}:")
+        print(f"  {body[:120]}")
+        return True
+
+    payload = {"body": body}
+    cmd = [
+        "glab", "api",
+        f"projects/:id/merge_requests/{mr_number}/discussions/{discussion_id}/notes",
+        "--method", "POST",
+        "--header", "Content-Type: application/json",
+        "--input", "-",
+    ]
+    try:
+        subprocess.run(cmd, input=json.dumps(payload), capture_output=True, text=True, check=True)
+        logger.info("✓ Replied to discussion %s", discussion_id[:12])
+        return True
+    except subprocess.CalledProcessError as err:
+        logger.error("Failed to reply to discussion %s: %s", discussion_id[:12], err.stderr)
+        return False
+
+
+def _post_replies(mr_number: int, replies: list, dry_run: bool) -> tuple:
+    """Post replies to existing MR discussion threads.
+
+    Args:
+        mr_number: The MR iid.
+        replies: List of reply dicts (each with discussion_id and body).
+        dry_run: If True, only print what would be done.
+
+    Returns:
+        Tuple of (posted_count, skipped_count, failed_count).
+    """
+    posted, skipped, failed = 0, 0, 0
+    for reply in replies:
+        discussion_id = reply.get("discussion_id", "")
+        body = reply.get("body", "").strip()
+        if not discussion_id or not body:
+            logger.warning("Reply entry missing discussion_id or body, skipping")
+            continue
+        result = _post_discussion_reply(mr_number, discussion_id, body, dry_run)
+        if result is None:
+            skipped += 1
+        elif result:
+            posted += 1
+        else:
+            failed += 1
+    return posted, skipped, failed
 
 
 def _post_inline_findings(
@@ -208,31 +296,52 @@ def cmd_comment(args) -> int:
             logger.error("MR number must be specified via --mr or in review YAML")
             return 1
 
-        position = _fetch_mr_position(mr_number)
-        if position is None:
-            logger.error("Could not get commit SHAs from MR. Falling back to general comment.")
-            return post_general_comment(mr_number, review_data, args.dry_run)
+        exit_code = 0
+
+        replies = review_data.get("replies", [])
+        if replies:
+            r_posted, r_skipped, r_failed = _post_replies(mr_number, replies, args.dry_run)
+            if args.dry_run:
+                print(
+                    f"\n[DRY RUN] Replies: {r_posted} would post, "
+                    f"{r_skipped} already posted, {r_failed} failed — MR !{mr_number}"
+                )
+            else:
+                logger.info(
+                    "✓ Replies: %d posted, %d skipped, %d failed to MR !%s",
+                    r_posted, r_skipped, r_failed, mr_number,
+                )
+            if r_failed:
+                exit_code = 1
 
         findings = review_data.get("findings", [])
-        posted_count, skipped_count, failed_count = _post_inline_findings(
-            mr_number, findings, position, args.dry_run
-        )
+        if findings:
+            position = _fetch_mr_position(mr_number)
+            if position is None:
+                logger.error("Could not get commit SHAs from MR. Falling back to general comment.")
+                return post_general_comment(mr_number, review_data, args.dry_run)
 
-        if args.dry_run:
-            print(
-                f"\n[DRY RUN] Would post {posted_count} inline comments "
-                f"({skipped_count} already posted, {failed_count} failed) to MR !{mr_number}"
-            )
-        else:
-            logger.info(
-                "✓ Posted %d inline comments to MR !%s (%d skipped, %d failed)",
-                posted_count,
-                mr_number,
-                skipped_count,
-                failed_count,
+            posted_count, skipped_count, failed_count = _post_inline_findings(
+                mr_number, findings, position, args.dry_run
             )
 
-        return 0
+            if args.dry_run:
+                print(
+                    f"\n[DRY RUN] Would post {posted_count} inline comments "
+                    f"({skipped_count} already posted, {failed_count} failed) to MR !{mr_number}"
+                )
+            else:
+                logger.info(
+                    "✓ Posted %d inline comments to MR !%s (%d skipped, %d failed)",
+                    posted_count,
+                    mr_number,
+                    skipped_count,
+                    failed_count,
+                )
+            if failed_count:
+                exit_code = 1
+
+        return exit_code
 
     except subprocess.CalledProcessError as err:
         logger.error("Command failed: %s", err.stderr)
