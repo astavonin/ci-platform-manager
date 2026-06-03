@@ -315,3 +315,41 @@ class TestRunGlabCommand:
         with pytest.raises(PlatformError, match="glab command not found"):
             # NOLINTNEXTLINE(protected-access): Testing private method
             handler._run_glab_command(["api", "projects"])
+
+
+class TestGetJobInfo:
+    """Test get_job_info method."""
+
+    @patch("projctl.handlers.pipeline_handler.PipelineHandler._run_glab_command")
+    def test_get_job_info_success(self, mock_run_glab: Mock, new_config_path: Path) -> None:
+        """Fetch job metadata successfully."""
+        config = Config(new_config_path)
+        handler = PipelineHandler(config)
+
+        job_data = {
+            "id": 789,
+            "name": "test:unit",
+            "stage": "test",
+            "status": "failed",
+            "duration": 42.5,
+        }
+        mock_run_glab.return_value = json.dumps(job_data)
+
+        result = handler.get_job_info(789)
+
+        assert result["id"] == 789
+        assert result["name"] == "test:unit"
+        call_args = mock_run_glab.call_args[0][0]
+        assert "api" in call_args
+        assert "jobs/789" in " ".join(call_args)
+
+    @patch("projctl.handlers.pipeline_handler.PipelineHandler._run_glab_command")
+    def test_get_job_info_invalid_json(self, mock_run_glab: Mock, new_config_path: Path) -> None:
+        """Invalid JSON response raises PlatformError."""
+        config = Config(new_config_path)
+        handler = PipelineHandler(config)
+
+        mock_run_glab.return_value = "not-json"
+
+        with pytest.raises(PlatformError, match="Failed to parse job info response"):
+            handler.get_job_info(789)

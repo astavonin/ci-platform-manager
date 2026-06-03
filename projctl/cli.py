@@ -227,6 +227,26 @@ def cmd_sync(args) -> int:
         return 1
 
 
+def _print_job_with_logs(job: dict, logs: str) -> None:
+    """Print header and pre-fetched logs for a single pipeline job.
+
+    Args:
+        job: Job data dictionary from the pipeline API.
+        logs: Pre-fetched job log content.
+    """
+    job_name = job.get("name")
+    job_stage = job.get("stage")
+    job_status = job.get("status")
+    job_duration = job.get("duration") or 0
+    print(f"### Job: {job_name}\n")
+    print(f"- **Stage:** {job_stage}")
+    print(f"- **Status:** {job_status}")
+    print(f"- **Duration:** {job_duration:.1f}s\n")
+    print("**Logs:**\n```")
+    print(logs)
+    print("```\n")
+
+
 def _print_job_logs(handler: PipelineHandler, job: dict) -> None:
     """Print header and logs for a single failed pipeline job.
 
@@ -259,6 +279,30 @@ def _print_job_logs(handler: PipelineHandler, job: dict) -> None:
     print("```\n")
 
 
+def _cmd_pipeline_debug_by_job_id(args) -> int:
+    """Fetch and print logs for a single job given by --job-id.
+
+    Args:
+        args: Parsed command-line arguments (requires args.config, args.job_id).
+
+    Returns:
+        Exit code (0 for success, 1 for error).
+    """
+    try:
+        config_path = Path(args.config) if args.config else None
+        config = Config(config_path)
+        handler = PipelineHandler(config)
+        job = handler.get_job_info(args.job_id)
+        logs = handler.get_job_logs(args.job_id)
+        print("\n# Job Debug Results\n")
+        print(f"**Job ID:** {args.job_id}\n")
+        _print_job_with_logs(job, logs)
+        return 0
+    except (FileNotFoundError, PlatformError, ValueError) as err:
+        logger.error("Error: %s", err)
+        return 1
+
+
 def cmd_pipeline_debug(args) -> int:
     """Handle the 'pipeline-debug' subcommand - debug failed pipeline jobs.
 
@@ -268,6 +312,9 @@ def cmd_pipeline_debug(args) -> int:
     Returns:
         Exit code (0 for success, 1 for error).
     """
+    if args.job_id:
+        return _cmd_pipeline_debug_by_job_id(args)
+
     try:
         config_path = Path(args.config) if args.config else None
         config = Config(config_path)
@@ -919,6 +966,11 @@ def _add_pipeline_debug_subparser(subparsers: argparse._SubParsersAction) -> Non
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--branch", type=str, help="Branch name (default: current git branch)")
+    p.add_argument(
+        "--job-id",
+        type=int,
+        help="Job ID to fetch logs from directly, bypassing branch/pipeline discovery.",
+    )
 
 
 def cmd_create_mr_dispatch(args) -> int:

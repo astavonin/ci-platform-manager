@@ -417,14 +417,20 @@ Platform dispatch: uses `gh pr create` for GitHub, `glab mr create` for GitLab, 
 
 ### Pipeline Debugging
 
-Debug failed CI/CD pipeline jobs on the current (or specified) branch:
+Debug failed CI/CD pipeline jobs. GitLab only.
+
+**By branch** — fetches all failed jobs from the latest pipeline on the branch:
 
 ```bash
 projctl pipeline-debug
 projctl pipeline-debug --branch feature/my-branch
 ```
 
-Fetches failed job logs from the latest pipeline and prints a summary. GitLab only.
+**By job ID** — fetches logs for a single job directly, bypassing branch and pipeline discovery:
+
+```bash
+projctl pipeline-debug --job-id 5946580
+```
 
 **Handler:** `handlers/pipeline_handler.py` — `PipelineHandler` class
 

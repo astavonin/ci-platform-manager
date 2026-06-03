@@ -247,3 +247,27 @@ class PipelineHandler:
         except PlatformError as err:
             # Re-raise with more context
             raise PlatformError(f"Failed to fetch logs for job #{job_id}: {err}") from err
+
+    def get_job_info(self, job_id: int) -> Dict[str, Any]:
+        """Fetch metadata for a single job.
+
+        Args:
+            job_id: Job ID.
+
+        Returns:
+            dict with job metadata (name, stage, status, duration, etc.)
+
+        Raises:
+            PlatformError: If API error or job not found.
+        """
+        logger.debug("Fetching info for job #%s", job_id)
+
+        project_id = self.get_project_id()
+        encoded_project = urllib.parse.quote(project_id, safe="")
+        api_endpoint = f"projects/{encoded_project}/jobs/{job_id}"
+
+        output = self._run_glab_command(["api", api_endpoint])
+        try:
+            return json.loads(output)  # type: ignore[no-any-return]
+        except json.JSONDecodeError as err:
+            raise PlatformError(f"Failed to parse job info response: {err}") from err
