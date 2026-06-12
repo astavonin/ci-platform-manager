@@ -40,7 +40,7 @@ def parse_issue_url(issue_ref: str) -> Tuple[Optional[str], Optional[str]]:
         parts = issue_ref.split("/-/issues/")
         if len(parts) == 2:
             project_url = parts[0]
-            iid = parts[1].split("/")[0].split("?")[0]
+            iid = parts[1].split("/")[0].split("?")[0].split("#")[0]
 
             # Extract project path from URL
             # Format: https://gitlab.example.com/group/subgroup/project
@@ -53,7 +53,7 @@ def parse_issue_url(issue_ref: str) -> Tuple[Optional[str], Optional[str]]:
         parts = issue_ref.split("/-/work_items/")
         if len(parts) == 2:
             project_url = parts[0]
-            iid = parts[1].split("/")[0].split("?")[0]
+            iid = parts[1].split("/")[0].split("?")[0].split("#")[0]
             project_path = extract_path_from_url(project_url)
             return (project_path, iid)
 

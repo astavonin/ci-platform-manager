@@ -21,6 +21,7 @@ from .config import Config
 from .exceptions import PlatformError
 from .handlers.comment import cmd_comment
 from .handlers.labels import LabelsHandler
+from .handlers.note import NoteHandler
 from .handlers.creator import EpicIssueCreator
 from .handlers.github_creator import GithubIssueCreator
 from .handlers.github_loader import GithubLoader
@@ -927,6 +928,66 @@ def cmd_wiki(args) -> int:
         return 1
 
 
+def _add_note_subparser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the 'note' subcommand."""
+    p = subparsers.add_parser(
+        "note",
+        help="Post a note (comment) to a GitLab issue or MR",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  note issue 340 --body "Closing as false-positive; passes after clean rebuild."
+  note mr !194 --body "LGTM"
+  note issue #340 --body "See also #341" --dry-run
+        """,
+    )
+    p.add_argument(
+        "resource_type",
+        choices=["issue", "mr"],
+        help="Type of resource to comment on",
+    )
+    p.add_argument(
+        "reference",
+        type=str,
+        help="Resource reference (number, #number/!number, or URL)",
+    )
+    p.add_argument("--body", type=str, required=True, help="Note body text")
+    p.add_argument("--dry-run", action="store_true", help="Preview without posting")
+
+
+def cmd_note(args) -> int:
+    """Handle the 'note' subcommand.
+
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        Exit code (0 for success, 1 for error).
+    """
+    try:
+        config_path = Path(args.config) if args.config else None
+        config = Config(config_path)
+
+        if config.platform != "gitlab":
+            logger.error("Error: 'note' command is only supported for GitLab")
+            return 1
+
+        handler = NoteHandler(config, dry_run=args.dry_run)
+
+        if args.resource_type == "issue":
+            handler.add_issue_note(args.reference, args.body)
+        else:
+            handler.add_mr_note(args.reference, args.body)
+
+        return 0
+    except FileNotFoundError as err:
+        logger.error(str(err))
+        return 1
+    except (PlatformError, ValueError) as err:
+        logger.error("Error: %s", err)
+        return 1
+
+
 def _add_labels_subparser(subparsers: argparse._SubParsersAction) -> None:
     """Register the 'labels' subcommand."""
     subparsers.add_parser(
@@ -1026,6 +1087,7 @@ Examples:
   %(prog)s sync push
   %(prog)s sync status
   %(prog)s update issue 231 --title "New title"
+  %(prog)s note issue 340 --body "Closing as false-positive."
   %(prog)s pipeline-debug
 
 Documentation:
@@ -1050,6 +1112,7 @@ Documentation:
     _add_update_subparser(subparsers)
     _add_pipeline_debug_subparser(subparsers)
     _add_wiki_subparser(subparsers)
+    _add_note_subparser(subparsers)
     _add_labels_subparser(subparsers)
 
     args = parser.parse_args(argv)
@@ -1075,6 +1138,7 @@ Documentation:
         "update": cmd_update,
         "pipeline-debug": cmd_pipeline_debug,
         "wiki": cmd_wiki,
+        "note": cmd_note,
         "labels": cmd_labels,
     }
 
