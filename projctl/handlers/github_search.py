@@ -107,7 +107,8 @@ class GithubSearchHandler:
             issues: List of issue dictionaries.
             query: The search query used (for display).
         """
-        print(f'\n=== ISSUES matching "{query}" ===\n')
+        filter_str = f'"{query}"' if query else "(all)"
+        print(f"\n=== ISSUES matching {filter_str} ===\n")
 
         if not issues:
             print("No issues found")
@@ -138,7 +139,8 @@ class GithubSearchHandler:
             milestones: List of milestone dictionaries.
             query: The search query used (for display).
         """
-        print(f'\n=== MILESTONES matching "{query}" ===\n')
+        filter_str = f'"{query}"' if query else "(all)"
+        print(f"\n=== MILESTONES matching {filter_str} ===\n")
 
         if not milestones:
             print("No milestones found")

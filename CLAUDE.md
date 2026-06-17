@@ -603,13 +603,28 @@ rsync -av --delete \
 
 ## Development
 
+### After Modifying projctl
+
+**Always use `pipx` — never `pip install -e .`.**
+
+`projctl` is installed system-wide via `pipx`. After any source change, reinstall with:
+
+```bash
+pipx install -e ~/projects/projctl --force
+```
+
+Do NOT use `pip install` or `pip install -e .` — the environment is externally managed and `pip` will refuse or corrupt the install.
+
+To also set up the dev venv (for running tests and linters):
+
+```bash
+make install   # creates .venv + runs pipx install -e . --force
+```
+
 ### Running Tests
 
 ```bash
-# Install dev dependencies
-pip install -e ".[dev]"
-
-# Run all tests
+# Run all tests (uses .venv set up by make install)
 pytest tests/
 
 # Run specific test module
@@ -766,12 +781,12 @@ default_epic labels are NOT required for loading epics (only for creating them).
 
 **Issue: Command not found**
 ```
-Solution: Install package: pip install -e . or use python3 -m projctl
+Solution: pipx install -e ~/projects/projctl --force
 ```
 
 **Issue: Import errors**
 ```
-Solution: Ensure in correct directory, reinstall: pipx install -e ~/projects/projctl
+Solution: Ensure in correct directory, reinstall: pipx install -e ~/projects/projctl --force
 ```
 
 ## Additional Resources

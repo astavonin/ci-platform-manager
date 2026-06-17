@@ -3,7 +3,7 @@
 import json
 import logging
 import urllib.parse
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ..config import Config
 from ..utils.glab_runner import run_glab_command
@@ -27,14 +27,19 @@ class SearchHandler:
         return run_glab_command(cmd)
 
     def search_issues(
-        self, query: str, state: str = "all", limit: int = 20
+        self,
+        query: str = "",
+        state: str = "all",
+        limit: int = 20,
+        labels: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Search for issues matching a query and print the results.
 
         Args:
-            query: Search text for title and description.
+            query: Search text for title and description. Empty string matches all.
             state: Filter by state ('opened', 'closed', 'all').
             limit: Maximum number of results to return.
+            labels: List of label names to filter by. Each is URL-encoded; multiple labels are AND-filtered.
 
         Returns:
             List of issue dictionaries.
@@ -42,27 +47,37 @@ class SearchHandler:
         Raises:
             PlatformError: If search fails.
         """
-        # Build API endpoint for current project
-        api_endpoint = f"projects/:fullpath/issues?search={urllib.parse.quote(query)}"
-
+        params = []
+        if query:
+            params.append(f"search={urllib.parse.quote(query)}")
         if state != "all":
-            api_endpoint += f"&state={state}"
+            params.append(f"state={state}")
+        if labels:
+            params.append(f"labels={','.join(urllib.parse.quote(lbl, safe='') for lbl in labels)}")
+        params.append(f"per_page={limit}")
+        api_endpoint = f"projects/:fullpath/issues?{'&'.join(params)}"
 
-        api_endpoint += f"&per_page={limit}"
-
+        logger.debug("GET %s", api_endpoint)
         output = self._run_glab_command(["api", api_endpoint])
 
         results: List[Dict[str, Any]] = json.loads(output) if output else []
-        self.print_issues(results, query)
+        self.print_issues(results, query, labels)
         return results
 
-    def search_epics(self, query: str, state: str = "all", limit: int = 20) -> List[Dict[str, Any]]:
+    def search_epics(
+        self,
+        query: str = "",
+        state: str = "all",
+        limit: int = 20,
+        labels: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """Search for epics matching a query and print the results.
 
         Args:
-            query: Search text for title and description.
+            query: Search text for title and description. Empty string matches all.
             state: Filter by state ('opened', 'closed', 'all').
             limit: Maximum number of results to return.
+            labels: List of label names to filter by. Each is URL-encoded; multiple labels are AND-filtered.
 
         Returns:
             List of epic dictionaries.
@@ -79,26 +94,30 @@ class SearchHandler:
             )
 
         encoded_group = urllib.parse.quote(group_path, safe="")
-        api_endpoint = f"groups/{encoded_group}/epics?search={urllib.parse.quote(query)}"
-
+        params = []
+        if query:
+            params.append(f"search={urllib.parse.quote(query)}")
         if state != "all":
-            api_endpoint += f"&state={state}"
+            params.append(f"state={state}")
+        if labels:
+            params.append(f"labels={','.join(urllib.parse.quote(lbl, safe='') for lbl in labels)}")
+        params.append(f"per_page={limit}")
+        api_endpoint = f"groups/{encoded_group}/epics?{'&'.join(params)}"
 
-        api_endpoint += f"&per_page={limit}"
-
+        logger.debug("GET %s", api_endpoint)
         output = self._run_glab_command(["api", api_endpoint])
 
         results: List[Dict[str, Any]] = json.loads(output) if output else []
-        self.print_epics(results, query)
+        self.print_epics(results, query, labels)
         return results
 
     def search_milestones(
-        self, query: str, state: str = "all", limit: int = 20
+        self, query: str = "", state: str = "all", limit: int = 20
     ) -> List[Dict[str, Any]]:
         """Search for milestones matching a query and print the results.
 
         Args:
-            query: Search text for title.
+            query: Search text for title. Empty string matches all milestones.
             state: Filter by state ('active', 'closed', 'all').
             limit: Maximum number of results to return.
 
@@ -108,36 +127,44 @@ class SearchHandler:
         Raises:
             PlatformError: If search fails.
         """
-        # Use group API if default_group is configured, otherwise use project API
         group_path = self.config.get_default_group()
+        params = []
+        if query:
+            params.append(f"search={urllib.parse.quote(query)}")
+        if state != "all":
+            params.append(f"state={state}")
+        params.append(f"per_page={limit}")
 
         if group_path:
-            # Use group milestones API
             encoded_group = urllib.parse.quote(group_path, safe="")
-            api_endpoint = f"groups/{encoded_group}/milestones?search={urllib.parse.quote(query)}"
+            api_endpoint = f"groups/{encoded_group}/milestones?{'&'.join(params)}"
         else:
-            # Use project milestones API
-            api_endpoint = f"projects/:fullpath/milestones?search={urllib.parse.quote(query)}"
+            api_endpoint = f"projects/:fullpath/milestones?{'&'.join(params)}"
 
-        if state != "all":
-            api_endpoint += f"&state={state}"
-
-        api_endpoint += f"&per_page={limit}"
-
+        logger.debug("GET %s", api_endpoint)
         output = self._run_glab_command(["api", api_endpoint])
 
         results: List[Dict[str, Any]] = json.loads(output) if output else []
         self.print_milestones(results, query)
         return results
 
-    def print_issues(self, issues: List[Dict[str, Any]], query: str) -> None:
+    def print_issues(
+        self, issues: List[Dict[str, Any]], query: str, labels: Optional[List[str]] = None
+    ) -> None:
         """Print search results for issues in text format.
 
         Args:
             issues: List of issue dictionaries.
             query: The search query used.
+            labels: Label filter applied, if any.
         """
-        print(f'\n=== ISSUES matching "{query}" ===\n')
+        parts = []
+        if query:
+            parts.append(f'"{query}"')
+        if labels:
+            parts.append(f"label:{', '.join(labels)}")
+        filter_str = " + ".join(parts) if parts else "(all)"
+        print(f"\n=== ISSUES matching {filter_str} ===\n")
 
         if not issues:
             print("No issues found")
@@ -147,24 +174,33 @@ class SearchHandler:
             iid = issue.get("iid")
             title = issue.get("title", "Untitled")
             state = issue.get("state", "unknown")
-            labels = issue.get("labels", [])
+            issue_labels = issue.get("labels", [])
             url = issue.get("web_url", "")
 
             print(f"#{iid} {title}")
-            label_str = ", ".join(labels) if labels else "none"
+            label_str = ", ".join(issue_labels) if issue_labels else "none"
             print(f"    State: {state} | Labels: {label_str}")
             print(f"    URL: {url}\n")
 
         print(f"Found {len(issues)} issue{'s' if len(issues) != 1 else ''}")
 
-    def print_epics(self, epics: List[Dict[str, Any]], query: str) -> None:
+    def print_epics(
+        self, epics: List[Dict[str, Any]], query: str, labels: Optional[List[str]] = None
+    ) -> None:
         """Print search results for epics in text format.
 
         Args:
             epics: List of epic dictionaries.
             query: The search query used.
+            labels: Label filter applied, if any.
         """
-        print(f'\n=== EPICS matching "{query}" ===\n')
+        parts = []
+        if query:
+            parts.append(f'"{query}"')
+        if labels:
+            parts.append(f"label:{', '.join(labels)}")
+        filter_str = " + ".join(parts) if parts else "(all)"
+        print(f"\n=== EPICS matching {filter_str} ===\n")
 
         if not epics:
             print("No epics found")
@@ -174,24 +210,25 @@ class SearchHandler:
             iid = epic.get("iid")
             title = epic.get("title", "Untitled")
             state = epic.get("state", "unknown")
-            labels = epic.get("labels", [])
+            epic_labels = epic.get("labels", [])
             url = epic.get("web_url", "")
 
             print(f"&{iid} {title}")
-            label_str = ", ".join(labels) if labels else "none"
+            label_str = ", ".join(epic_labels) if epic_labels else "none"
             print(f"    State: {state} | Labels: {label_str}")
             print(f"    URL: {url}\n")
 
         print(f"Found {len(epics)} epic{'s' if len(epics) != 1 else ''}")
 
-    def print_milestones(self, milestones: List[Dict[str, Any]], query: str) -> None:
+    def print_milestones(self, milestones: List[Dict[str, Any]], query: str = "") -> None:
         """Print search results for milestones in text format.
 
         Args:
             milestones: List of milestone dictionaries.
-            query: The search query used.
+            query: The search query used. Empty string shows (all).
         """
-        print(f'\n=== MILESTONES matching "{query}" ===\n')
+        filter_str = f'"{query}"' if query else "(all)"
+        print(f"\n=== MILESTONES matching {filter_str} ===\n")
 
         if not milestones:
             print("No milestones found")

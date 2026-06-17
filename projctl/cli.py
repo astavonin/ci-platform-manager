@@ -147,6 +147,89 @@ def cmd_load(args) -> int:
         return 1
 
 
+def _validate_label_for_gitlab_search(search_type: str, labels: list | None) -> str | None:
+    """Return an error message if the label filter cannot be applied, or None when valid.
+
+    Args:
+        search_type: The search resource type (issues, epics, milestones).
+        labels: The list of label names, or None when not provided.
+
+    Returns:
+        An error message string if validation fails, otherwise None.
+    """
+    if not labels:
+        return None
+    if search_type == "milestones":
+        return "--label filter is not supported for milestones"
+    return None
+
+
+def _dispatch_gitlab_search(searcher: SearchHandler, args) -> int:
+    """Dispatch a GitLab search call based on resource type.
+
+    Args:
+        searcher: The SearchHandler instance.
+        args: Parsed command-line arguments.
+
+    Returns:
+        Exit code (0 for success, 1 for error).
+    """
+    labels = None
+    if getattr(args, "label", None):
+        labels = [lbl for lbl in args.label if lbl.strip()]
+        if not labels:
+            print("Error: --label requires a non-empty label name", file=sys.stderr)
+            return 1
+
+    label_error = _validate_label_for_gitlab_search(args.type, labels)
+    if label_error:
+        print(f"Error: {label_error}", file=sys.stderr)
+        return 1
+
+    if args.type == "issues":
+        searcher.search_issues(query=args.query, state=args.state, limit=args.limit, labels=labels)
+    elif args.type == "epics":
+        searcher.search_epics(query=args.query, state=args.state, limit=args.limit, labels=labels)
+    elif args.type == "milestones":
+        searcher.search_milestones(query=args.query, state=args.state, limit=args.limit)
+    else:
+        logger.error("Unknown search type: %s", args.type)
+        return 1
+
+    return 0
+
+
+def _dispatch_github_search(gh_searcher: GithubSearchHandler, args) -> int:
+    """Dispatch a GitHub search call based on resource type.
+
+    Args:
+        gh_searcher: The GithubSearchHandler instance.
+        args: Parsed command-line arguments.
+
+    Returns:
+        Exit code (0 for success, 1 for error).
+    """
+    if getattr(args, "label", None):
+        print("Error: --label filter is not supported for GitHub (GitLab only)", file=sys.stderr)
+        return 1
+    if args.type == "issues":
+        if args.state == "active":
+            print(
+                "Error: --state active is not supported for GitHub (milestone-only state)",
+                file=sys.stderr,
+            )
+            return 1
+        # GitLab uses "opened"; the gh CLI expects "open"
+        gh_state = "open" if args.state == "opened" else args.state
+        gh_searcher.search_issues(query=args.query, state=gh_state)
+    elif args.type == "milestones":
+        gh_searcher.search_milestones(query=args.query)
+    else:
+        logger.error("Search type '%s' is not supported on GitHub", args.type)
+        return 1
+    return 0
+
+
 def cmd_search(args) -> int:
     """Handle the 'search' subcommand.
 
@@ -157,32 +240,14 @@ def cmd_search(args) -> int:
         Exit code (0 for success, 1 for error).
     """
     try:
-        # Load configuration
         config_path = Path(args.config) if args.config else None
         config = Config(config_path)
 
         if config.platform == "github":
-            gh_searcher = GithubSearchHandler(config=config)
-            if args.type == "issues":
-                gh_searcher.search_issues(query=args.query, state=args.state)
-            elif args.type == "milestones":
-                gh_searcher.search_milestones(query=args.query)
-            else:
-                logger.error("Search type '%s' is not supported on GitHub", args.type)
-                return 1
-        else:
-            searcher = SearchHandler(config=config)
-            if args.type == "issues":
-                searcher.search_issues(query=args.query, state=args.state, limit=args.limit)
-            elif args.type == "epics":
-                searcher.search_epics(query=args.query, state=args.state, limit=args.limit)
-            elif args.type == "milestones":
-                searcher.search_milestones(query=args.query, state=args.state, limit=args.limit)
-            else:
-                logger.error("Unknown search type: %s", args.type)
-                return 1
+            return _dispatch_github_search(GithubSearchHandler(config=config), args)
 
-        return 0
+        return _dispatch_gitlab_search(SearchHandler(config=config), args)
+
     except FileNotFoundError as err:
         logger.error(str(err))
         return 1
@@ -702,7 +767,13 @@ def _add_search_subparser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument(
         "type", choices=["issues", "epics", "milestones"], help="Type of resource to search"
     )
-    p.add_argument("query", type=str, help="Search query text (searches title and description)")
+    p.add_argument(
+        "query",
+        type=str,
+        nargs="?",
+        default="",
+        help="Search query text (searches title and description). Optional when --label is used.",
+    )
     p.add_argument(
         "--state",
         choices=["opened", "closed", "active", "all"],
@@ -710,6 +781,13 @@ def _add_search_subparser(subparsers: argparse._SubParsersAction) -> None:
         help='Filter by state (default: all). Use "active" for milestones.',
     )
     p.add_argument("--limit", type=int, default=20, help="Maximum number of results (default: 20)")
+    p.add_argument(
+        "--label",
+        action="append",
+        dest="label",
+        metavar="LABEL",
+        help="Filter by label (can be repeated for multiple labels; issues and epics only)",
+    )
 
 
 def _add_comment_subparser(subparsers: argparse._SubParsersAction) -> None:
@@ -1082,6 +1160,7 @@ Examples:
   %(prog)s load 113
   %(prog)s load &21
   %(prog)s search issues "streaming"
+  %(prog)s search epics --label "Iteration::1"
   %(prog)s comment planning/reviews/MR134-review.yaml
   %(prog)s create-mr --title "Add feature X" --draft
   %(prog)s sync push
