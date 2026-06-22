@@ -1075,6 +1075,7 @@ class TestStatusIntegration:
             "--exclude=*.swp",
             "--exclude=*~",
             "--exclude=.DS_Store",
+            "--exclude=.workflow-safety.log",
             f"{planning}/",
             f"{gdrive_repo}/",
         ]
@@ -1222,6 +1223,7 @@ class TestStatusIntegration:
             "--exclude=*.swp",
             "--exclude=*~",
             "--exclude=.DS_Store",
+            "--exclude=.workflow-safety.log",
             f"{gdrive_repo}/",
             f"{planning}/",
         ]
