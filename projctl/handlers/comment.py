@@ -183,21 +183,37 @@ def _parse_hunk_lines(
             valid.add((file_path, new_line))
 
 
-def _parse_diff_lines(diffs: list) -> Set[Tuple[str, int]]:
-    """Extract valid (file_path, new_line) pairs from GitLab diff objects."""
+def _parse_diff_lines(diffs: list) -> Tuple[Set[Tuple[str, int]], Set[str]]:
+    """Extract valid (file_path, new_line) pairs from GitLab diff objects.
+
+    Returns:
+        (valid_lines, unchecked_files) where unchecked_files contains paths whose
+        diff content was empty (GitLab silently omits content for large new files even
+        when too_large is False). Lines in unchecked files must not be pre-validated
+        — the inline attempt should proceed and fall back to a note only on API error.
+    """
     valid: Set[Tuple[str, int]] = set()
+    unchecked: Set[str] = set()
     for diff in diffs:
         new_path = diff.get("new_path", "")
         diff_text = diff.get("diff", "")
-        if new_path and diff_text:
+        if not new_path:
+            continue
+        if diff_text:
             _parse_hunk_lines(new_path, diff_text, valid)
-    return valid
+        else:
+            unchecked.add(new_path)
+    return valid, unchecked
 
 
-def _fetch_mr_diff_lines(mr_number: int) -> Optional[Set[Tuple[str, int]]]:
+def _fetch_mr_diff_lines(mr_number: int) -> Optional[Tuple[Set[Tuple[str, int]], Set[str]]]:
     """Fetch valid (file_path, new_line) pairs from the MR diff.
 
-    Returns None on error; caller falls back to attempting inline without pre-validation.
+    Returns:
+        (valid_lines, unchecked_files) on success, or None on error.
+        None causes the caller to skip pre-validation entirely (old behaviour).
+        unchecked_files holds paths whose diff text was empty in the API response;
+        lines in those files are not blocked from inline posting.
     """
     cmd = [
         "glab",
@@ -307,7 +323,9 @@ def _post_inline_findings(
         Tuple of (posted_count, skipped_count, failed_count).
     """
     existing_bodies = _fetch_existing_note_bodies(mr_number)
-    valid_diff_lines = _fetch_mr_diff_lines(mr_number) if not dry_run else None
+    diff_result = _fetch_mr_diff_lines(mr_number) if not dry_run else None
+    valid_diff_lines: Optional[Set[Tuple[str, int]]] = diff_result[0] if diff_result else None
+    unchecked_files: Optional[Set[str]] = diff_result[1] if diff_result else None
     posted_count, skipped_count, failed_count = 0, 0, 0
     for finding in findings:
         finding_results = _process_finding_locations(finding)
@@ -324,6 +342,7 @@ def _post_inline_findings(
                     dry_run=dry_run,
                     existing_bodies=existing_bodies,
                     valid_diff_lines=valid_diff_lines,
+                    unchecked_files=unchecked_files,
                 )
                 if result is None:
                     skipped_count += 1
@@ -533,6 +552,7 @@ def post_inline_comment(  # pylint: disable=too-many-return-statements
     *,
     existing_bodies: Optional[set] = None,
     valid_diff_lines: Optional[Set[Tuple[str, int]]] = None,
+    unchecked_files: Optional[Set[str]] = None,
 ) -> Optional[bool]:
     """Post an inline comment on a specific line in the MR diff.
 
@@ -546,6 +566,9 @@ def post_inline_comment(  # pylint: disable=too-many-return-statements
             duplicates when the command is re-run after a partial failure.
         valid_diff_lines: Set of (file_path, line_num) pairs present in the MR
             diff; when provided, lines absent from it skip directly to note fallback.
+        unchecked_files: Files whose diff content was empty in the GitLab API response
+            (large new files). Lines in these files are not pre-validated — the inline
+            API call is attempted and falls back to a note only on failure.
 
     Returns:
         True if comment posted successfully (or already existed), False otherwise
@@ -580,7 +603,15 @@ def post_inline_comment(  # pylint: disable=too-many-return-statements
             return None  # None signals "skipped", distinct from True (posted) / False (failed)
 
         # Skip inline attempt for lines confirmed absent from the diff.
-        if valid_diff_lines is not None and (file_path, line_num) not in valid_diff_lines:
+        # Files in unchecked_files had empty diff content in the API response (GitLab
+        # silently omits diff text for large new files); treat them as unvalidated and
+        # let the inline API call decide.
+        file_is_unchecked = unchecked_files is not None and file_path in unchecked_files
+        if (
+            not file_is_unchecked
+            and valid_diff_lines is not None
+            and (file_path, line_num) not in valid_diff_lines
+        ):
             logger.debug(
                 "Line %s:%d not in MR diff — posting as note directly",
                 file_path,
