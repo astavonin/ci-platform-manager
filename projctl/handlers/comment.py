@@ -2,10 +2,11 @@
 
 import json
 import logging
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
     import yaml
@@ -95,7 +96,7 @@ def _load_review_data(review_file: str) -> tuple:
     return review_data, review_data.get("mr_number")
 
 
-def _fetch_mr_position(mr_number: int) -> "CommentPosition | None":
+def _fetch_mr_position(mr_number: int) -> Optional[CommentPosition]:
     """Fetch base and head SHAs for an MR to build inline comment positions.
 
     Args:
@@ -160,6 +161,60 @@ def _fetch_discussion_note_bodies(mr_number: int, discussion_id: str) -> set:
     except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as err:
         logger.warning("Could not fetch discussion %s notes: %s", discussion_id[:12], err)
         return set()
+
+
+def _parse_hunk_lines(
+    file_path: str, diff_text: str, valid: Set[Tuple[str, int]]
+) -> None:
+    """Add (file_path, new_line_number) pairs from a unified diff to valid."""
+    new_line = 0
+    for line in diff_text.splitlines():
+        if line.startswith("@@"):
+            m = re.search(r"\+(\d+)", line)
+            if m:
+                new_line = int(m.group(1)) - 1
+        elif line.startswith("-"):
+            pass  # removed line — not addressable by new_line
+        elif line.startswith("\\ "):
+            pass  # "No newline at end of file" marker
+        else:
+            # added lines ("+") and context lines both increment new_line
+            new_line += 1
+            valid.add((file_path, new_line))
+
+
+def _parse_diff_lines(diffs: list) -> Set[Tuple[str, int]]:
+    """Extract valid (file_path, new_line) pairs from GitLab diff objects."""
+    valid: Set[Tuple[str, int]] = set()
+    for diff in diffs:
+        new_path = diff.get("new_path", "")
+        diff_text = diff.get("diff", "")
+        if new_path and diff_text:
+            _parse_hunk_lines(new_path, diff_text, valid)
+    return valid
+
+
+def _fetch_mr_diff_lines(mr_number: int) -> Optional[Set[Tuple[str, int]]]:
+    """Fetch valid (file_path, new_line) pairs from the MR diff.
+
+    Returns None on error; caller falls back to attempting inline without pre-validation.
+    """
+    cmd = [
+        "glab",
+        "api",
+        f"projects/:id/merge_requests/{mr_number}/diffs",
+        "--method",
+        "GET",
+        "-F",
+        "per_page=100",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        diffs = json.loads(result.stdout)
+        return _parse_diff_lines(diffs)
+    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, AttributeError, TypeError) as err:
+        logger.debug("Could not fetch MR diff lines for pre-validation: %s", err)
+        return None
 
 
 def _post_discussion_reply(
@@ -237,7 +292,7 @@ def _post_replies(mr_number: int, replies: list, dry_run: bool) -> tuple:
 def _post_inline_findings(
     mr_number: int,
     findings: list,
-    position: "CommentPosition",
+    position: CommentPosition,
     dry_run: bool,
 ) -> tuple:
     """Process findings and post them as inline comments.
@@ -252,6 +307,7 @@ def _post_inline_findings(
         Tuple of (posted_count, skipped_count, failed_count).
     """
     existing_bodies = _fetch_existing_note_bodies(mr_number)
+    valid_diff_lines = _fetch_mr_diff_lines(mr_number) if not dry_run else None
     posted_count, skipped_count, failed_count = 0, 0, 0
     for finding in findings:
         finding_results = _process_finding_locations(finding)
@@ -267,6 +323,7 @@ def _post_inline_findings(
                     position=position,
                     dry_run=dry_run,
                     existing_bodies=existing_bodies,
+                    valid_diff_lines=valid_diff_lines,
                 )
                 if result is None:
                     skipped_count += 1
@@ -394,6 +451,78 @@ def _post_note_fallback(
         return False
 
 
+def _format_comment_body(finding: Dict[str, Any]) -> str:
+    """Build the markdown comment body from a finding dict."""
+    severity = finding.get("severity", "Unknown")
+    title = finding.get("title", "Untitled")
+    description = finding.get("description", "").strip()
+    fix = finding.get("fix", "").strip()
+    extra_locations = finding.get("_extra_locations", [])
+
+    body = f"**{severity}: {title}**\n\n{description}"
+
+    if extra_locations:
+        locs_str = ", ".join(f"`{loc}`" for loc in extra_locations)
+        body += f"\n\n**Also affects:** {locs_str}"
+
+    if fix:
+        body += f"\n\n**Fix:**\n```\n{fix}\n```"
+
+    return body
+
+
+def _post_inline_via_api(  # pylint: disable=too-many-positional-arguments
+    # All 7 arguments are distinct data needed by the API call; no sensible grouping exists.
+    mr_number: int,
+    file_path: str,
+    line_num: int,
+    location: str,
+    comment_body: str,
+    position: CommentPosition,
+    existing_bodies: set,
+) -> Optional[bool]:
+    """Send the inline discussion API call and fall back to a note on failure."""
+    payload = {
+        "body": comment_body,
+        "position": {
+            "position_type": "text",
+            "old_path": file_path,
+            "new_path": file_path,
+            "old_line": None,  # null for new files
+            "new_line": line_num,
+            "base_sha": position.base_sha,
+            "start_sha": position.base_sha,
+            "head_sha": position.head_sha,
+        },
+    }
+    cmd = [
+        "glab",
+        "api",
+        f"projects/:id/merge_requests/{mr_number}/discussions",
+        "--method",
+        "POST",
+        "--header",
+        "Content-Type: application/json",
+        "--input",
+        "-",
+    ]
+    logger.debug("Posting comment to %s:%d", file_path, line_num)
+    try:
+        subprocess.run(cmd, input=json.dumps(payload), capture_output=True, text=True, check=True)
+        logger.info("✓ Posted inline comment on %s:%d", file_path, line_num)
+        return True
+    except subprocess.CalledProcessError as err:
+        # GitLab returns 500 when the line is not part of the diff.
+        # Fall back to a general note so the finding is never silently dropped.
+        logger.warning(
+            "Inline comment failed for %s:%d (%s) — falling back to note",
+            file_path,
+            line_num,
+            err.stderr.strip(),
+        )
+        return _post_note_fallback(mr_number, location, comment_body, existing_bodies)
+
+
 def post_inline_comment(  # pylint: disable=too-many-return-statements
     # Each return guards a distinct failure/skip path; collapsing them would obscure intent.
     mr_number: int,
@@ -402,7 +531,8 @@ def post_inline_comment(  # pylint: disable=too-many-return-statements
     position: CommentPosition,
     dry_run: bool = False,
     *,
-    existing_bodies: "set | None" = None,
+    existing_bodies: Optional[set] = None,
+    valid_diff_lines: Optional[Set[Tuple[str, int]]] = None,
 ) -> Optional[bool]:
     """Post an inline comment on a specific line in the MR diff.
 
@@ -414,6 +544,8 @@ def post_inline_comment(  # pylint: disable=too-many-return-statements
         dry_run: If True, only print what would be done
         existing_bodies: Set of note bodies already on the MR; used to skip
             duplicates when the command is re-run after a partial failure.
+        valid_diff_lines: Set of (file_path, line_num) pairs present in the MR
+            diff; when provided, lines absent from it skip directly to note fallback.
 
     Returns:
         True if comment posted successfully (or already existed), False otherwise
@@ -432,28 +564,13 @@ def post_inline_comment(  # pylint: disable=too-many-return-statements
         else:
             line_num = int(line_part)
 
-        # Format comment body
-        severity = finding.get("severity", "Unknown")
-        title = finding.get("title", "Untitled")
-        description = finding.get("description", "").strip()
-        fix = finding.get("fix", "").strip()
-        extra_locations = finding.get("_extra_locations", [])
-
-        comment_body = f"**{severity}: {title}**\n\n{description}"
-
-        if extra_locations:
-            locs_str = ", ".join(f"`{loc}`" for loc in extra_locations)
-            comment_body += f"\n\n**Also affects:** {locs_str}"
-
-        if fix:
-            comment_body += f"\n\n**Fix:**\n```\n{fix}\n```"
+        comment_body = _format_comment_body(finding)
+        bodies = existing_bodies or set()
 
         # Skip if this comment body was already posted (as inline or fallback note).
         # Fallback notes embed comment_body after a location prefix, so substring
         # matching catches both forms.
-        already_posted = existing_bodies and any(
-            comment_body in existing for existing in existing_bodies
-        )
+        already_posted = existing_bodies and any(comment_body in existing for existing in bodies)
 
         if already_posted:
             if dry_run:
@@ -462,57 +579,27 @@ def post_inline_comment(  # pylint: disable=too-many-return-statements
                 logger.info("Skipping already-posted comment on %s:%d", file_path, line_num)
             return None  # None signals "skipped", distinct from True (posted) / False (failed)
 
-        if dry_run:
-            print(f"\n[DRY RUN] Would post comment on {file_path}:{line_num}")
-            print(f"  Severity: {severity}")
-            print(f"  Title: {title}")
-            return True
-
-        # Prepare JSON payload with position data including old_line: null
-        payload = {
-            "body": comment_body,
-            "position": {
-                "position_type": "text",
-                "old_path": file_path,
-                "new_path": file_path,
-                "old_line": None,  # null for new files
-                "new_line": line_num,
-                "base_sha": position.base_sha,
-                "start_sha": position.base_sha,
-                "head_sha": position.head_sha,
-            },
-        }
-
-        # Post using GitLab API via glab with JSON input and Content-Type header
-        cmd = [
-            "glab",
-            "api",
-            f"projects/:id/merge_requests/{mr_number}/discussions",
-            "--method",
-            "POST",
-            "--header",
-            "Content-Type: application/json",
-            "--input",
-            "-",
-        ]
-
-        logger.debug("Posting comment to %s:%d", file_path, line_num)
-        try:
-            subprocess.run(
-                cmd, input=json.dumps(payload), capture_output=True, text=True, check=True
-            )
-            logger.info("✓ Posted inline comment on %s:%d", file_path, line_num)
-            return True
-        except subprocess.CalledProcessError as err:
-            # GitLab returns 500 when the line is not part of the diff.
-            # Fall back to a general note so the finding is never silently dropped.
-            logger.warning(
-                "Inline comment failed for %s:%d (%s) — falling back to note",
+        # Skip inline attempt for lines confirmed absent from the diff.
+        if valid_diff_lines is not None and (file_path, line_num) not in valid_diff_lines:
+            logger.debug(
+                "Line %s:%d not in MR diff — posting as note directly",
                 file_path,
                 line_num,
-                err.stderr.strip(),
             )
-            return _post_note_fallback(mr_number, location, comment_body, existing_bodies or set())
+            if dry_run:
+                print(f"\n[DRY RUN] Line not in diff, would post as note on {file_path}:{line_num}")
+                return True
+            return _post_note_fallback(mr_number, location, comment_body, bodies)
+
+        if dry_run:
+            print(f"\n[DRY RUN] Would post comment on {file_path}:{line_num}")
+            print(f"  Severity: {finding.get('severity', 'Unknown')}")
+            print(f"  Title: {finding.get('title', 'Untitled')}")
+            return True
+
+        return _post_inline_via_api(
+            mr_number, file_path, line_num, location, comment_body, position, bodies
+        )
 
     except (json.JSONDecodeError, KeyError, TypeError) as err:
         logger.error("Error posting comment on %s: %s", location, err)
