@@ -37,7 +37,7 @@ def _assert_exclude_shape(patterns: tuple[str, ...]) -> None:
     )
 
 
-RSYNC_EXCLUDES: tuple[str, ...] = ("*.swp", "*~", ".DS_Store", ".workflow-safety.log")
+RSYNC_EXCLUDES: tuple[str, ...] = ("*.swp", "*~", ".DS_Store", ".workflow-safety.log", "memory")
 _assert_exclude_shape(RSYNC_EXCLUDES)
 
 
