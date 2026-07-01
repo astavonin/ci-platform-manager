@@ -55,10 +55,10 @@ test: venv
 # Run all linters
 lint: pylint
 	@echo "Running flake8..."
-	$(FLAKE8) projctl || true
+	$(FLAKE8) projctl
 	@echo ""
 	@echo "Running mypy..."
-	$(MYPY) projctl || true
+	$(MYPY) projctl
 
 # Run pylint only
 pylint: venv

@@ -636,57 +636,41 @@ rsync -av --delete \
 
 ## Development
 
+### Setup (first time only)
+
+```bash
+make install   # creates .venv with dev tools (pytest, pylint, mypy, black, flake8)
+               # also registers the CLI globally via pipx
+```
+
+Two separate environments are created:
+- `.venv/` — isolated dev tooling (pytest, linters). Uses pip internally, but is sandboxed from the system Python.
+- pipx environment — the `projctl` CLI installed system-wide. **Never install this with bare `pip install -e .`** — use pipx only.
+
 ### After Modifying projctl
 
-**Always use `pipx` — never `pip install -e .`.**
-
-`projctl` is installed system-wide via `pipx`. After any source change, reinstall with:
+Reinstall the CLI via pipx so the system-wide `projctl` command picks up the changes:
 
 ```bash
 pipx install -e ~/projects/projctl --force
 ```
 
-Do NOT use `pip install` or `pip install -e .` — the environment is externally managed and `pip` will refuse or corrupt the install.
-
-To also set up the dev venv (for running tests and linters):
-
-```bash
-make install   # creates .venv + runs pipx install -e . --force
-```
+No need to re-run `make install` — the `.venv` dev tools do not need reinstalling after code changes.
 
 ### Running Tests
 
 ```bash
-# Run all tests (uses .venv set up by make install)
-pytest tests/
-
-# Run specific test module
-pytest tests/test_config.py -v
-
-# Run with coverage
-pytest --cov=projctl --cov-report=term-missing
-
-# Run specific test
-pytest tests/test_config.py::TestConfig::test_planning_sync_config -v
+make test                                              # run full suite with coverage
+.venv/bin/pytest tests/test_config.py -v              # single module
+.venv/bin/pytest tests/test_config.py::TestConfig::test_planning_sync_config -v
 ```
 
 ### Linting
 
-All linters installed in `.venv/bin/`:
-
 ```bash
-# Pylint (code quality)
-pylint projctl/ --rcfile=pyproject.toml
-
-# Flake8 (style)
-flake8 projctl/ --max-line-length=120
-
-# Mypy (type checking)
-mypy projctl/ --config-file=pyproject.toml
-
-# Black (formatting)
-black projctl/ --check
-black projctl/  # Apply formatting
+make lint      # pylint + flake8 + mypy (all must pass)
+make pylint    # pylint only
+make format    # apply black formatting
 ```
 
 **Project Standards:**
