@@ -5,12 +5,21 @@ import subprocess
 from typing import Set, Tuple
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from projctl.handlers.comment import (
     CommentPosition,
+    DEFAULT_APPROVAL_STATUS,
+    VALID_APPROVAL_STATUSES,
+    _apply_approval_status,
     _fetch_mr_diff_lines,
+    _is_already_approved_error,
+    _is_not_approved_error,
+    _load_review_data,
     _parse_diff_lines,
     _parse_hunk_lines,
     _post_inline_findings,
+    cmd_comment,
     post_inline_comment,
 )
 
@@ -430,3 +439,235 @@ class TestPostInlineFindingsDiffFetch:
 
         _, kwargs = mock_post.call_args
         assert kwargs.get("unchecked_files") == unchecked
+
+
+# ---------------------------------------------------------------------------
+# TestApplyApprovalStatus
+# ---------------------------------------------------------------------------
+
+
+class TestApplyApprovalStatus:
+    """Tests for _apply_approval_status."""
+
+    def test_approved_calls_glab_mr_approve(self) -> None:
+        """approval='approved' runs 'glab mr approve <mr>'."""
+        with patch(_PATCH_SUBPROCESS) as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = _apply_approval_status(42, "approved", dry_run=False)
+        assert result is True
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ["glab", "mr", "approve", "42"]
+
+    def test_changes_requested_calls_unapprove(self) -> None:
+        """approval='changes_requested' calls 'glab mr unapprove <mr>'."""
+        with patch(_PATCH_SUBPROCESS) as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = _apply_approval_status(42, "changes_requested", dry_run=False)
+        assert result is True
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ["glab", "mr", "unapprove", "42"]
+
+    def test_none_skips_all_approval_actions(self) -> None:
+        """approval='none' returns True without calling glab."""
+        with patch(_PATCH_SUBPROCESS) as mock_run:
+            result = _apply_approval_status(42, "none", dry_run=False)
+        assert result is True
+        mock_run.assert_not_called()
+
+    @patch("builtins.print")
+    def test_approved_dry_run_does_not_call_glab(self, mock_print: MagicMock) -> None:
+        """dry_run=True prints the would-approve message without calling glab."""
+        with patch(_PATCH_SUBPROCESS) as mock_run:
+            result = _apply_approval_status(42, "approved", dry_run=True)
+        assert result is True
+        mock_run.assert_not_called()
+        printed = " ".join(str(c) for c in mock_print.call_args_list)
+        assert "Would approve" in printed
+
+    def test_glab_failure_returns_false(self) -> None:
+        """CalledProcessError from glab mr approve returns False."""
+        with patch(_PATCH_SUBPROCESS) as mock_run:
+            mock_run.side_effect = subprocess.CalledProcessError(1, "glab", stderr="error")
+            result = _apply_approval_status(42, "approved", dry_run=False)
+        assert result is False
+
+    def test_already_approved_error_treated_as_success(self) -> None:
+        """glab returning 'already approved' stderr is treated as success, not failure."""
+        with patch(_PATCH_SUBPROCESS) as mock_run:
+            mock_run.side_effect = subprocess.CalledProcessError(
+                1, "glab", stderr="User has already approved this merge request"
+            )
+            result = _apply_approval_status(42, "approved", dry_run=False)
+        assert result is True
+
+    def test_changes_requested_not_approved_treated_as_success(self) -> None:
+        """glab unapprove returning 'not approved' stderr is treated as success (idempotent)."""
+        with patch(_PATCH_SUBPROCESS) as mock_run:
+            mock_run.side_effect = subprocess.CalledProcessError(
+                1, "glab", stderr="User has not approved this merge request"
+            )
+            result = _apply_approval_status(42, "changes_requested", dry_run=False)
+        assert result is True
+
+    @patch("builtins.print")
+    def test_changes_requested_dry_run_does_not_call_glab(self, mock_print: MagicMock) -> None:
+        """dry_run=True for changes_requested prints intent without calling glab."""
+        with patch(_PATCH_SUBPROCESS) as mock_run:
+            result = _apply_approval_status(42, "changes_requested", dry_run=True)
+        assert result is True
+        mock_run.assert_not_called()
+        printed = " ".join(str(c) for c in mock_print.call_args_list)
+        assert "Would revoke" in printed
+
+    def test_default_approval_status_is_approved(self) -> None:
+        """DEFAULT_APPROVAL_STATUS is 'approved'."""
+        assert DEFAULT_APPROVAL_STATUS == "approved"
+
+    def test_valid_approval_statuses_contains_expected_values(self) -> None:
+        """VALID_APPROVAL_STATUSES contains all three expected values."""
+        assert VALID_APPROVAL_STATUSES == {"approved", "changes_requested", "none"}
+
+
+# ---------------------------------------------------------------------------
+# TestLoadReviewDataApprovalValidation
+# ---------------------------------------------------------------------------
+
+
+class TestLoadReviewDataApprovalValidation:
+    """Tests for approval field validation in _load_review_data."""
+
+    def test_missing_approval_does_not_raise(self, tmp_path) -> None:
+        """YAML without approval field loads without error."""
+        f = tmp_path / "review.yaml"
+        f.write_text("findings:\n  - title: F1\n    location: a.py:1\n")
+        data, _, approval = _load_review_data(str(f))
+        assert "approval" not in data
+        assert approval == DEFAULT_APPROVAL_STATUS
+
+    def test_valid_approval_changes_requested_passes(self, tmp_path) -> None:
+        """approval: changes_requested is accepted without error."""
+        f = tmp_path / "review.yaml"
+        f.write_text("approval: changes_requested\nfindings:\n  - title: F1\n    location: a.py:1\n")
+        data, _, approval = _load_review_data(str(f))
+        assert data["approval"] == "changes_requested"
+        assert approval == "changes_requested"
+
+    def test_valid_approval_none_passes(self, tmp_path) -> None:
+        """approval: none is accepted without error."""
+        f = tmp_path / "review.yaml"
+        f.write_text("approval: none\nfindings:\n  - title: F1\n    location: a.py:1\n")
+        data, _, approval = _load_review_data(str(f))
+        assert data["approval"] == "none"
+        assert approval == "none"
+
+    def test_invalid_approval_raises_value_error(self, tmp_path) -> None:
+        """An unrecognised approval value raises ValueError naming the bad value and valid choices."""
+        f = tmp_path / "review.yaml"
+        f.write_text("approval: reject\nfindings:\n  - title: F1\n    location: a.py:1\n")
+        with pytest.raises(ValueError, match="Invalid approval status 'reject'"):
+            _load_review_data(str(f))
+
+    def test_invalid_approval_error_lists_valid_values(self, tmp_path) -> None:
+        """ValueError message enumerates all valid approval values."""
+        f = tmp_path / "review.yaml"
+        f.write_text("approval: wrong\nfindings:\n  - title: F1\n    location: a.py:1\n")
+        with pytest.raises(ValueError) as exc_info:
+            _load_review_data(str(f))
+        msg = str(exc_info.value)
+        assert "approved" in msg
+        assert "changes_requested" in msg
+        assert "none" in msg
+
+
+# ---------------------------------------------------------------------------
+# TestCmdCommentApprovalWiring
+# ---------------------------------------------------------------------------
+
+
+class TestCmdCommentApprovalWiring:
+    """Tests for approval field wiring in cmd_comment."""
+
+    def _make_args(self, mr_number: int = 42, dry_run: bool = False) -> MagicMock:
+        args = MagicMock()
+        args.mr_number = mr_number
+        args.dry_run = dry_run
+        args.review_file = "review.yaml"
+        return args
+
+    @patch("projctl.handlers.comment._apply_approval_status")
+    @patch("projctl.handlers.comment._load_review_data")
+    def test_approval_value_forwarded_to_apply(self, mock_load: MagicMock, mock_apply: MagicMock) -> None:
+        """approval from YAML is forwarded verbatim to _apply_approval_status."""
+        mock_load.return_value = ({"approval": "changes_requested"}, 42, "changes_requested")
+        mock_apply.return_value = True
+
+        cmd_comment(self._make_args())
+
+        mock_apply.assert_called_once_with(42, "changes_requested", False)
+
+    @patch("projctl.handlers.comment._apply_approval_status")
+    @patch("projctl.handlers.comment._load_review_data")
+    def test_missing_approval_defaults_to_approved(self, mock_load: MagicMock, mock_apply: MagicMock) -> None:
+        """When approval is absent from YAML, 'approved' is forwarded to _apply_approval_status."""
+        mock_load.return_value = ({}, 42, "approved")
+        mock_apply.return_value = True
+
+        cmd_comment(self._make_args())
+
+        mock_apply.assert_called_once_with(42, "approved", False)
+
+    @patch("projctl.handlers.comment._apply_approval_status")
+    @patch("projctl.handlers.comment._load_review_data")
+    def test_apply_failure_returns_exit_code_1(self, mock_load: MagicMock, mock_apply: MagicMock) -> None:
+        """_apply_approval_status returning False causes cmd_comment to return 1."""
+        mock_load.return_value = ({"approval": "approved"}, 42, "approved")
+        mock_apply.return_value = False
+
+        result = cmd_comment(self._make_args())
+
+        assert result == 1
+
+    @patch("projctl.handlers.comment._apply_approval_status")
+    @patch("projctl.handlers.comment._load_review_data")
+    def test_apply_success_returns_exit_code_0(self, mock_load: MagicMock, mock_apply: MagicMock) -> None:
+        """_apply_approval_status returning True causes cmd_comment to return 0."""
+        mock_load.return_value = ({"approval": "approved"}, 42, "approved")
+        mock_apply.return_value = True
+
+        result = cmd_comment(self._make_args())
+
+        assert result == 0
+
+    @patch("projctl.handlers.comment._apply_approval_status")
+    @patch("projctl.handlers.comment._load_review_data")
+    def test_dry_run_forwarded_to_apply(self, mock_load: MagicMock, mock_apply: MagicMock) -> None:
+        """dry_run flag is forwarded to _apply_approval_status."""
+        mock_load.return_value = ({"approval": "none"}, 42, "none")
+        mock_apply.return_value = True
+
+        cmd_comment(self._make_args(dry_run=True))
+
+        mock_apply.assert_called_once_with(42, "none", True)
+
+    @patch("projctl.handlers.comment._apply_approval_status")
+    @patch("projctl.handlers.comment.post_general_comment")
+    @patch("projctl.handlers.comment._fetch_mr_position")
+    @patch("projctl.handlers.comment._load_review_data")
+    def test_position_none_fallback_still_calls_apply_approval(
+        self,
+        mock_load: MagicMock,
+        mock_fetch_pos: MagicMock,
+        mock_general: MagicMock,
+        mock_apply: MagicMock,
+    ) -> None:
+        """When _fetch_mr_position returns None, approval is still applied after the fallback comment."""
+        mock_load.return_value = ({"approval": "approved", "findings": [{"title": "F1", "location": "a.py:1"}]}, 42, "approved")
+        mock_fetch_pos.return_value = None
+        mock_general.return_value = 0
+        mock_apply.return_value = True
+
+        cmd_comment(self._make_args())
+
+        mock_apply.assert_called_once_with(42, "approved", False)

@@ -16,6 +16,9 @@ except ImportError as exc:
 
 logger = logging.getLogger(__name__)
 
+VALID_APPROVAL_STATUSES = frozenset({"approved", "changes_requested", "none"})
+DEFAULT_APPROVAL_STATUS = "approved"
+
 
 @dataclass
 class CommentPosition:
@@ -71,17 +74,17 @@ def _process_finding_locations(finding: Dict[str, Any]) -> list:
 
 
 def _load_review_data(review_file: str) -> tuple:
-    """Load and validate review YAML, returning (review_data, mr_number) or raising on error.
+    """Load and validate review YAML, returning (review_data, mr_number, approval) or raising on error.
 
     Args:
         review_file: Path to the review YAML file.
 
     Returns:
-        Tuple of (review_data dict, mr_number or None).
+        Tuple of (review_data dict, mr_number or None, approval string).
 
     Raises:
         FileNotFoundError: If the review file does not exist.
-        ValueError: If required fields are missing.
+        ValueError: If required fields are missing or approval value is invalid.
         yaml.YAMLError: If the YAML is invalid.
     """
     if not Path(review_file).exists():
@@ -93,7 +96,14 @@ def _load_review_data(review_file: str) -> tuple:
     if "findings" not in review_data and "replies" not in review_data:
         raise ValueError("Review YAML must contain 'findings' or 'replies' field")
 
-    return review_data, review_data.get("mr_number")
+    approval = review_data.get("approval", DEFAULT_APPROVAL_STATUS)
+    if approval not in VALID_APPROVAL_STATUSES:
+        raise ValueError(
+            f"Invalid approval status '{approval}'. "
+            f"Must be one of: {', '.join(sorted(VALID_APPROVAL_STATUSES))}"
+        )
+
+    return review_data, review_data.get("mr_number"), approval
 
 
 def _fetch_mr_position(mr_number: int) -> Optional[CommentPosition]:
@@ -353,6 +363,114 @@ def _post_inline_findings(
     return posted_count, skipped_count, failed_count
 
 
+def _is_already_approved_error(stderr: str) -> bool:
+    """Return True when the glab stderr indicates the MR is already approved."""
+    lowered = stderr.lower()
+    return "already approved" in lowered or "user has already approved" in lowered
+
+
+def _is_not_approved_error(stderr: str) -> bool:
+    """Return True when the glab stderr indicates there is no approval to revoke."""
+    lowered = stderr.lower()
+    return (
+        "not approved" in lowered
+        or "user has not approved" in lowered
+        or "cannot unapprove" in lowered
+    )
+
+
+def _run_approve(mr_number: int) -> bool:
+    """Call 'glab mr approve' and return True on success or already-approved errors."""
+    cmd = ["glab", "mr", "approve", str(mr_number)]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        logger.info("✓ Approved MR !%s", mr_number)
+        return True
+    except subprocess.CalledProcessError as err:
+        if _is_already_approved_error(err.stderr):
+            logger.info("MR !%s is already approved, treating as success", mr_number)
+            return True
+        logger.error("Failed to approve MR !%s: %s", mr_number, err.stderr)
+        return False
+
+
+def _run_unapprove(mr_number: int) -> bool:
+    """Call 'glab mr unapprove' and return True on success or not-approved errors."""
+    cmd = ["glab", "mr", "unapprove", str(mr_number)]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        logger.info("✓ Revoked approval on MR !%s", mr_number)
+        return True
+    except subprocess.CalledProcessError as err:
+        if _is_not_approved_error(err.stderr):
+            logger.info("MR !%s was not approved, nothing to revoke", mr_number)
+            return True
+        logger.error("Failed to revoke approval on MR !%s: %s", mr_number, err.stderr)
+        return False
+
+
+def _apply_approval_status(mr_number: int, approval: str, dry_run: bool) -> bool:
+    """Apply the approval decision to the MR.
+
+    Args:
+        mr_number: The MR iid.
+        approval: One of "approved", "changes_requested", or "none".
+        dry_run: If True, only print what would be done.
+
+    Returns:
+        True on success. Also True when the approval is skipped ("none") or reverted
+        ("changes_requested" with no prior approval to revoke). False on subprocess failure.
+    """
+    if approval == "changes_requested":
+        if dry_run:
+            print(f"\n[DRY RUN] Would revoke approval on MR !{mr_number}")
+            return True
+        return _run_unapprove(mr_number)
+
+    if approval == "none":
+        if dry_run:
+            print(f"\n[DRY RUN] Approval status: 'none' — no approval action on MR !{mr_number}")
+        else:
+            logger.info("Approval status: 'none' — no approval action for MR !%s", mr_number)
+        return True
+
+    # approval == "approved"
+    if dry_run:
+        print(f"\n[DRY RUN] Would approve MR !{mr_number}")
+        return True
+    return _run_approve(mr_number)
+
+
+def _post_findings(mr_number: int, review_data: Dict[str, Any], dry_run: bool) -> int:
+    """Post inline findings (or fall back to a general comment) and return 0/1 exit code."""
+    findings = review_data.get("findings", [])
+    if not findings:
+        return 0
+
+    position = _fetch_mr_position(mr_number)
+    if position is None:
+        logger.error("Could not get commit SHAs from MR. Falling back to general comment.")
+        return post_general_comment(mr_number, review_data, dry_run)
+
+    posted_count, skipped_count, failed_count = _post_inline_findings(
+        mr_number, findings, position, dry_run
+    )
+    if dry_run:
+        print(
+            f"\n[DRY RUN] Would post {posted_count} inline comments "
+            f"({skipped_count} already posted, {failed_count} failed) to MR !{mr_number}"
+        )
+    else:
+        logger.info(
+            "✓ Posted %d inline comments to MR !%s (%d skipped, %d failed)",
+            posted_count,
+            mr_number,
+            skipped_count,
+            failed_count,
+        )
+    return 1 if failed_count else 0
+
+
 def cmd_comment(args) -> int:
     """Handle the 'comment' subcommand - post review from YAML file to MR.
 
@@ -362,10 +480,11 @@ def cmd_comment(args) -> int:
         args: Parsed command-line arguments.
 
     Returns:
-        Exit code (0 for success, 1 for error).
+        Exit code: 0 if all comments posted and approval applied; 1 if any step failed.
+        Approval failure (e.g. glab connectivity) counts as failure even if comments posted.
     """
     try:
-        review_data, yaml_mr_number = _load_review_data(args.review_file)
+        review_data, yaml_mr_number, approval = _load_review_data(args.review_file)
 
         mr_number = args.mr_number or yaml_mr_number
         if mr_number is None:
@@ -390,32 +509,11 @@ def cmd_comment(args) -> int:
             if r_failed:
                 exit_code = 1
 
-        findings = review_data.get("findings", [])
-        if findings:
-            position = _fetch_mr_position(mr_number)
-            if position is None:
-                logger.error("Could not get commit SHAs from MR. Falling back to general comment.")
-                return post_general_comment(mr_number, review_data, args.dry_run)
+        if _post_findings(mr_number, review_data, args.dry_run):
+            exit_code = 1
 
-            posted_count, skipped_count, failed_count = _post_inline_findings(
-                mr_number, findings, position, args.dry_run
-            )
-
-            if args.dry_run:
-                print(
-                    f"\n[DRY RUN] Would post {posted_count} inline comments "
-                    f"({skipped_count} already posted, {failed_count} failed) to MR !{mr_number}"
-                )
-            else:
-                logger.info(
-                    "✓ Posted %d inline comments to MR !%s (%d skipped, %d failed)",
-                    posted_count,
-                    mr_number,
-                    skipped_count,
-                    failed_count,
-                )
-            if failed_count:
-                exit_code = 1
+        if not _apply_approval_status(mr_number, approval, args.dry_run):
+            exit_code = 1
 
         return exit_code
 

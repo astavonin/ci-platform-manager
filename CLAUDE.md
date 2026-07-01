@@ -430,6 +430,39 @@ projctl comment review.yaml --mr 134
 projctl comment review.yaml --dry-run
 ```
 
+**Review YAML format:**
+```yaml
+mr_number: 134           # optional if passed via --mr
+approval: approved       # approved | changes_requested | none  (default: approved)
+
+findings:
+  - title: "Missing null check"
+    severity: High
+    description: "ptr may be null on the fast path"
+    location: "src/foo.cc:42"
+    fix: "if (!ptr) return;"
+
+  - title: "Unused import"
+    severity: Low
+    description: "import is never referenced"
+    locations:
+      - "src/bar.py:1"
+      - "src/baz.py:3"
+
+replies:
+  - discussion_id: "abc123def456"
+    body: "Fixed in the latest commit."
+```
+
+**`approval` field behaviour:**
+- `approved` (default): calls `glab mr approve` after posting comments. Already-approved MRs are treated as success.
+- `changes_requested`: calls `glab mr unapprove` to revoke any prior approval. MRs with no prior approval are treated as success.
+- `none`: posts comments only; takes no approval action.
+
+**Exit codes:**
+- 0: All comments posted and approval action succeeded (or was already in the desired state).
+- 1: One or more comments failed to post, or the approval action failed.
+
 **Create merge request:**
 ```bash
 projctl create-mr --title "Add feature X" --draft
