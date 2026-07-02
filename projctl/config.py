@@ -13,6 +13,30 @@ except ImportError as exc:
 from .utils.config_migration import transform_issue_template
 from .utils.git_helpers import get_current_repo_path
 
+_LEGACY_CONFIG_NAMES: frozenset[str] = frozenset({"glab_config.yaml"})
+
+
+def config_search_paths() -> list[tuple[Path, str]]:
+    """Return the default config search paths with human-readable labels.
+
+    Returns:
+        List of (path, label) pairs in priority order (first found wins).
+        Does not include the --config explicit-path option.
+    """
+    return [
+        (Path.cwd() / "glab_config.yaml", "./glab_config.yaml (project-local, legacy)"),
+        (Path.cwd() / "projctl.yaml", "./projctl.yaml (project-local, preferred)"),
+        (
+            Path.home() / ".config" / "projctl" / "config.yaml",
+            "~/.config/projctl/config.yaml (user config)",
+        ),
+        (
+            Path.home() / ".config" / "glab_config.yaml",
+            "~/.config/glab_config.yaml (user config, legacy)",
+        ),
+    ]
+
+
 # Known field names per template; unknown entries emit a UserWarning via _warn_unknown_fields.
 _KNOWN_ISSUE_FIELDS: frozenset[str] = frozenset({"weight"})
 # Empty: no epic field names are supported yet (reserved for future extension).
@@ -45,12 +69,8 @@ class Config:
     Loads configuration from YAML file with automatic legacy format detection.
     Configuration can be overridden by command-line arguments.
 
-    Config file resolution:
-    1. If --config is specified: use that path (fail if not found)
-    2. ./glab_config.yaml (project-local, legacy)
-    3. ./projctl.yaml (project-local, preferred)
-    4. ~/.config/projctl/config.yaml (user config)
-    5. ~/.config/glab_config.yaml (user config, legacy)
+    Auto-search order is defined by config_search_paths() — first found wins.
+    An explicit --config path takes priority and fails immediately if not found.
     """
 
     def __init__(self, config_path: Optional[Path] = None, platform: Optional[str] = None) -> None:
@@ -75,12 +95,8 @@ class Config:
     def _load_config_with_legacy_support(self, config_path: Optional[Path]) -> Dict[str, Any]:
         """Load config with automatic legacy format detection.
 
-        Search order (preserves backward compatibility):
-        1. Explicit --config path if provided
-        2. ./glab_config.yaml (project-local, legacy)
-        3. ./projctl.yaml (project-local, preferred)
-        4. ~/.config/projctl/config.yaml (user config)
-        5. ~/.config/glab_config.yaml (user config, legacy)
+        Auto-search order is defined by config_search_paths() — first found wins.
+        An explicit path is used as-is and fails immediately if not found.
 
         Args:
             config_path: Explicit config path or None for auto-search.
@@ -103,18 +119,11 @@ class Config:
             return self._load_config_file(config_path)
 
         # Search order for backward compatibility
-        search_paths = [
-            Path.cwd() / "glab_config.yaml",  # Project-local legacy
-            Path.cwd() / "projctl.yaml",  # Project-local (preferred)
-            Path.home() / ".config" / "projctl" / "config.yaml",  # User config
-            Path.home() / ".config" / "glab_config.yaml",  # User config legacy
-        ]
+        candidates = config_search_paths()
 
-        _legacy_names = {"glab_config.yaml"}
-
-        for candidate in search_paths:
+        for candidate, _ in candidates:
             if candidate.exists():
-                if candidate.name in _legacy_names:
+                if candidate.name in _LEGACY_CONFIG_NAMES:
                     warnings.warn(
                         f"Using legacy config name '{candidate.name}'. "
                         f"Consider renaming to projctl.yaml",
@@ -125,7 +134,8 @@ class Config:
 
         # No config found
         raise FileNotFoundError(
-            "No config file found. Searched:\n" + "\n".join(f"  - {p}" for p in search_paths)
+            "No config file found. Searched:\n"
+            + "\n".join(f"  - {p}" for p, _ in candidates)
         )
 
     def _load_config_file(self, config_path: Path) -> Dict[str, Any]:

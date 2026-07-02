@@ -70,7 +70,7 @@ projctl/
 Search order (first found wins):
 1. `--config` flag (explicit path)
 2. `./glab_config.yaml` (project-local, legacy)
-3. `./config.yaml` (project-local, new)
+3. `./projctl.yaml` (project-local, preferred)
 4. `~/.config/projctl/config.yaml` (user-wide)
 5. `~/.config/glab_config.yaml` (legacy)
 
@@ -601,7 +601,7 @@ ${GDRIVE_BASE}/backup/planning/
    ls ~/GoogleDrive  # Verify path
    ```
 
-2. Configure Google Drive path in `config.yaml`:
+2. Configure Google Drive path in `projctl.yaml`:
    ```yaml
    planning_sync:
      gdrive_base: ~/GoogleDrive  # Adjust for your mount point
@@ -840,7 +840,7 @@ Solution: Last write wins. Pull latest, manually merge if needed, push
 
 **Issue: Config file not found**
 ```
-Solution: Create config.yaml in project root or use --config flag
+Solution: Create projctl.yaml in project root or use --config flag
 ```
 
 **Issue: KeyError: 'default_epic' when loading config**

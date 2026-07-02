@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
-from projctl.config import Config, ConfigurationError
+from projctl.config import Config, ConfigurationError, config_search_paths
 
 
 class TestConfigLoading:
@@ -947,3 +947,59 @@ class TestGetRequiredFields:
         config = Config(config_path)
         with pytest.raises(ConfigurationError, match="mr_template.required_fields must be a list"):
             config.get_required_mr_fields()
+
+
+# ---------------------------------------------------------------------------
+# TestConfigSearchPaths
+# ---------------------------------------------------------------------------
+
+
+class TestConfigSearchPaths:
+    """Tests for the config_search_paths() module-level helper."""
+
+    def test_returns_four_entries(self) -> None:
+        """config_search_paths() returns exactly 4 (path, label) tuples."""
+        paths = config_search_paths()
+        assert len(paths) == 4
+
+    def test_all_entries_are_tuples_of_path_and_str(self) -> None:
+        """Every entry is a (Path, str) tuple."""
+        for path, label in config_search_paths():
+            assert isinstance(path, Path)
+            assert isinstance(label, str) and label
+
+    def test_first_two_entries_are_cwd_relative(self, monkeypatch, tmp_path: Path) -> None:
+        """The first two entries are under the current working directory."""
+        monkeypatch.chdir(tmp_path)
+        paths = config_search_paths()
+        assert paths[0][0].parent == tmp_path
+        assert paths[1][0].parent == tmp_path
+
+    def test_last_two_entries_are_home_relative(self) -> None:
+        """The last two entries are under the user home directory."""
+        home = Path.home()
+        paths = config_search_paths()
+        assert str(paths[2][0]).startswith(str(home))
+        assert str(paths[3][0]).startswith(str(home))
+
+    def test_legacy_name_appears_before_preferred_name(self) -> None:
+        """glab_config.yaml (legacy) appears before projctl.yaml (preferred) in order."""
+        paths = config_search_paths()
+        names = [p.name for p, _ in paths]
+        assert names.index("glab_config.yaml") < names.index("projctl.yaml")
+
+    def test_labels_are_human_readable(self) -> None:
+        """Every label contains the file name so it is self-describing."""
+        for path, label in config_search_paths():
+            assert path.name in label
+
+    def test_user_config_appears_before_legacy_user_config(self) -> None:
+        """~/.config/projctl/config.yaml appears before ~/.config/glab_config.yaml."""
+        paths = config_search_paths()
+        user_idx = next(i for i, (p, _) in enumerate(paths) if ".config/projctl" in str(p))
+        legacy_idx = next(
+            i
+            for i, (p, _) in enumerate(paths)
+            if p.name == "glab_config.yaml" and ".config" in str(p)
+        )
+        assert user_idx < legacy_idx

@@ -61,7 +61,7 @@ projctl/
 Search order (first found wins):
 1. `--config` flag (explicit path)
 2. `./glab_config.yaml` (project-local, legacy)
-3. `./config.yaml` (project-local, new)
+3. `./projctl.yaml` (project-local, preferred)
 4. `~/.config/projctl/config.yaml` (user-wide)
 5. `~/.config/glab_config.yaml` (legacy)
 

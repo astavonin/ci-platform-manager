@@ -17,7 +17,7 @@ except ImportError:
     print("Error: PyYAML is required. Install with: pip install PyYAML")
     sys.exit(1)
 
-from .config import Config
+from .config import Config, config_search_paths
 from .exceptions import PlatformError
 from .handlers.comment import cmd_comment
 from .handlers.labels import LabelsHandler
@@ -1133,6 +1133,39 @@ def cmd_create_mr_dispatch(args) -> int:
     return cmd_create_mr(args, config)
 
 
+def _add_config_subparser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """Register the 'config' subcommand."""
+    subparsers.add_parser(
+        "config",
+        help="Show the active config file path and its assembled contents",
+        description=(
+            "Resolve and display the active projctl configuration.\n\n"
+            "WARNING: Prints the full config file contents. "
+            "Do not share this output if your config contains secrets."
+        ),
+    )
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    """Print the resolved config file path and its assembled contents."""
+    try:
+        config_path = Path(args.config) if args.config else None
+        config = Config(config_path)
+    except FileNotFoundError as err:
+        logger.error(str(err))
+        return 1
+    except yaml.YAMLError as err:
+        logger.error("Config file contains invalid YAML: %s", err)
+        return 1
+
+    print(f"Config file: {config.loaded_config_path}")
+    print(f"Platform:    {config.platform}")
+    print()
+    print("Assembled config:")
+    print(yaml.dump(config.config_data, default_flow_style=False, sort_keys=False), end="")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Main entry point for the script.
 
@@ -1144,16 +1177,31 @@ def main(argv: list[str] | None = None) -> int:
     """
     claude_md_path = (Path(__file__).parent / "CLAUDE.md").resolve()
 
+    _search_summary_lines = ["  1. --config <path>  (explicit override)"]
+    _active_config_path: Path | None = None
+    for _i, (_path, _label) in enumerate(config_search_paths(), 2):
+        if _active_config_path is None and _path.exists():
+            _status = "← active"
+            _active_config_path = _path.resolve()
+        elif _path.exists():
+            _status = "(found, shadowed)"
+        else:
+            _status = "not found"
+        _search_summary_lines.append(f"  {_i}. {_label}  {_status}")
+    _search_summary = "\n".join(_search_summary_lines)
+    _active_line = (
+        f"  Active: {_active_config_path}"
+        if _active_config_path
+        else "  Active: none found (run from a directory with projctl.yaml, or use --config)"
+    )
+
     parser = argparse.ArgumentParser(
         description="GitLab Epic and Issue management tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
-Config file search order (first found wins):
-  1. --config <path>                   explicit path
-  2. ./glab_config.yaml                project-local (legacy)
-  3. ./projctl.yaml                    project-local (preferred)
-  4. ~/.config/projctl/config.yaml     user config
-  5. ~/.config/glab_config.yaml        user config (legacy)
+Config search order (first found wins):
+{_search_summary}
+{_active_line}
 
 Examples:
   %(prog)s create epic_definition.yaml
@@ -1168,6 +1216,7 @@ Examples:
   %(prog)s update issue 231 --title "New title"
   %(prog)s note issue 340 --body "Closing as false-positive."
   %(prog)s pipeline-debug
+  %(prog)s config
 
 Documentation:
   {claude_md_path}
@@ -1193,6 +1242,7 @@ Documentation:
     _add_wiki_subparser(subparsers)
     _add_note_subparser(subparsers)
     _add_labels_subparser(subparsers)
+    _add_config_subparser(subparsers)
 
     args = parser.parse_args(argv)
 
@@ -1219,6 +1269,7 @@ Documentation:
         "wiki": cmd_wiki,
         "note": cmd_note,
         "labels": cmd_labels,
+        "config": cmd_config,
     }
 
     try:
