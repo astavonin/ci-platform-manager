@@ -1,5 +1,6 @@
 """Shared pytest fixtures for projctl tests."""
 
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -9,6 +10,18 @@ import pytest
 import yaml
 
 from projctl.config import Config
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _cleanup_pytest_claude_stubs():
+    """Remove any pytest-created stub directories from ~/.claude/projects/ after the session."""
+    yield
+    projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.exists():
+        return
+    for entry in projects_dir.iterdir():
+        if entry.is_dir() and "-tmp-pytest-" in entry.name:
+            shutil.rmtree(entry, ignore_errors=True)
 
 
 @pytest.fixture

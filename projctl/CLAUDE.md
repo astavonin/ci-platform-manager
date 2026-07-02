@@ -577,6 +577,8 @@ Synchronize proprietary planning folders across multiple machines using Google D
 - Backup planning folders automatically
 - Keep planning folders in sync without git commits
 
+**Claude memory** — `sync push/pull` also syncs the Claude project memory directory (`~/.claude/projects/<encoded-repo-path>/memory/`) to `${GDRIVE_BASE}/backup/claude-memory/<encoded-repo-path>/`. Memory is private and excluded from git; this sync is its only cross-machine backup. The sync is skipped silently when the memory directory does not exist. `sync status` appends a `Memory STATUS:` section below the planning report.
+
 ### Architecture
 
 **Auto-Detection:**
@@ -591,11 +593,15 @@ ${GDRIVE_BASE}/backup/planning/
 │   ├── progress.md
 │   └── ci-platform-refactor/
 └── other-repos/          # Other repositories sync here automatically
+
+${GDRIVE_BASE}/backup/claude-memory/
+└── -home-alice-projects-genai-automations/   # Encoded repo root path
+    └── MEMORY.md
 ```
 
 **Sync Strategy:**
 - Uses `rsync` with `--delete` flag (last write wins)
-- Excludes: `*.swp`, `*~`, `.DS_Store`
+- Excludes: `*.swp`, `*~`, `.DS_Store`, `.workflow-safety.log`, `memory`
 - Efficient incremental sync (only changed files)
 - No version history (Google Drive provides 30-day file versioning)
 
@@ -713,8 +719,12 @@ rsync -av --delete \
   --exclude='*.swp' \
   --exclude='*~' \
   --exclude='.DS_Store' \
+  --exclude='.workflow-safety.log' \
+  --exclude='memory' \
   source/ target/
 ```
+
+**Memory pull does not use `--delete`** — local-only memory files are preserved to prevent accidental data loss (memory has no git backup).
 
 ## Development
 

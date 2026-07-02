@@ -26,8 +26,12 @@ from projctl.handlers.sync import (
     DriftClassification,
     ItemizeEntry,
     PlanningSyncHandler,
+    _MEMORY_RSYNC_EXCLUDES,
     _SyncPaths,
     _assert_exclude_shape,
+    _claude_memory_path,
+    _claude_projects_root,
+    _encode_repo_path,
     _is_timestamp_or_perms_only,
     _parse_itemize_line,
 )
@@ -260,6 +264,8 @@ def bare_handler(tmp_path: Path) -> PlanningSyncHandler:
         gdrive_base=gdrive_base,
         gdrive_planning_base=gdrive_base / "backup" / "planning",
         gdrive_repo_path=gdrive_repo,
+        memory_path=None,
+        gdrive_memory_path=tmp_path / "no-such-mem",  # non-existent sentinel
     )
     return handler
 
@@ -611,6 +617,7 @@ class TestStatusReadOnlyInvariant:
         "_classify_drift",
         "_format_status_report",
         "_is_timestamp_or_perms_only",
+        "_print_memory_status",
     )
 
     def _collect_call_names(self, tree: ast.AST) -> set[str]:
@@ -1428,6 +1435,8 @@ class TestRsyncErrorCodeBranches:
             gdrive_base=gdrive_base,
             gdrive_planning_base=gdrive_base / "backup" / "planning",
             gdrive_repo_path=gdrive_repo,
+            memory_path=None,
+            gdrive_memory_path=tmp_path / "no-such-mem",  # non-existent sentinel
         )
         return handler
 
@@ -1542,3 +1551,522 @@ class TestCliDispatchSyncStatus:
             with patch.object(PlanningSyncHandler, "status", lambda s: None):
                 rc = cmd_sync(args)
         assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — TestMemorySync: path helpers and push/pull/status memory legs
+# ---------------------------------------------------------------------------
+
+
+class TestMemorySync:
+    """Unit tests for Claude memory sync helpers and the push/pull/status memory legs."""
+
+    # -- Path helper tests ---------------------------------------------------
+
+    def test_encode_repo_path_replaces_all_slashes(self) -> None:
+        """_encode_repo_path replaces every '/' with '-', including the leading one."""
+        assert _encode_repo_path(Path("/home/alice/proj")) == "-home-alice-proj"
+
+    def test_encode_repo_path_preserves_leading_slash(self) -> None:
+        """_encode_repo_path encodes the leading '/' as '-'."""
+        assert _encode_repo_path(Path("/foo")) == "-foo"
+
+    def test_claude_memory_path_structure(self) -> None:
+        """_claude_memory_path returns ~/.claude/projects/<encoded>/memory."""
+        result = _claude_memory_path(Path("/home/alice/proj"))
+        # Verify the suffix is correct regardless of the actual home directory.
+        assert result.parts[-1] == "memory"
+        assert result.parts[-2] == "-home-alice-proj"
+        assert result.parts[-3] == "projects"
+        assert result.parts[-4] == ".claude"
+
+    # -- Exclude constant tests -----------------------------------------------
+
+    def test_memory_rsync_excludes_omits_memory_pattern(self) -> None:
+        """_MEMORY_RSYNC_EXCLUDES does not contain the 'memory' pattern."""
+        assert "memory" not in _MEMORY_RSYNC_EXCLUDES
+
+    def test_memory_rsync_excludes_is_subset_of_rsync_excludes(self) -> None:
+        """Every item in _MEMORY_RSYNC_EXCLUDES is also in RSYNC_EXCLUDES."""
+        for pat in _MEMORY_RSYNC_EXCLUDES:
+            assert pat in RSYNC_EXCLUDES
+
+    # -- Push memory leg tests ------------------------------------------------
+
+    def _make_bare_handler_with_memory(
+        self, tmp_path: Path, memory_present: bool
+    ) -> PlanningSyncHandler:
+        """Build a bare handler with optional memory_path set."""
+        planning = tmp_path / "planning"
+        planning.mkdir()
+        gdrive_base = tmp_path / "gdrive"
+        gdrive_base.mkdir()
+        gdrive_repo = gdrive_base / "backup" / "planning" / "repo"
+
+        memory_dir: Path | None = None
+        if memory_present:
+            memory_dir = tmp_path / "memory"
+            memory_dir.mkdir()
+
+        handler = PlanningSyncHandler.__new__(PlanningSyncHandler)
+        handler.config = None  # type: ignore[assignment]
+        handler.dry_run = False
+        handler.repo_root = tmp_path / "repo"
+        handler.repo_name = "repo"
+        handler.paths = _SyncPaths(
+            planning_path=planning,
+            gdrive_base=gdrive_base,
+            gdrive_planning_base=gdrive_base / "backup" / "planning",
+            gdrive_repo_path=gdrive_repo,
+            memory_path=memory_dir,
+            gdrive_memory_path=gdrive_base / "backup" / "claude-memory" / "-tmp-repo",
+        )
+        return handler
+
+    def test_push_calls_rsync_twice_when_memory_present(self, tmp_path: Path) -> None:
+        """push() invokes _run_rsync twice when a local memory directory exists."""
+        handler = self._make_bare_handler_with_memory(tmp_path, memory_present=True)
+        # gdrive_base already exists (created by _make_bare_handler_with_memory).
+
+        calls: list[dict] = []
+
+        def fake_run_rsync(source: Path, target: Path, description: str, **kwargs) -> None:
+            calls.append({"source": source, "target": target, "kwargs": kwargs})
+
+        with patch.object(handler, "_verify_rsync_available"):
+            with patch.object(handler, "_run_rsync", side_effect=fake_run_rsync):
+                handler.push()
+
+        assert len(calls) == 2
+        # Planning leg is first, memory leg is second.
+        assert calls[0]["source"] == handler.planning_path
+        assert calls[0]["target"] == handler.gdrive_repo_path
+        assert calls[1]["source"] == handler.memory_path
+        assert calls[1]["target"] == handler.gdrive_memory_path
+        # Second call must use _MEMORY_RSYNC_EXCLUDES.
+        second_call_excludes = calls[1]["kwargs"].get("excludes")
+        assert second_call_excludes == _MEMORY_RSYNC_EXCLUDES
+
+    def test_push_calls_rsync_once_when_memory_absent(self, tmp_path: Path) -> None:
+        """push() invokes _run_rsync only once when no local memory directory exists."""
+        handler = self._make_bare_handler_with_memory(tmp_path, memory_present=False)
+
+        calls: list[dict] = []
+
+        def fake_run_rsync(source: Path, target: Path, description: str, **kwargs) -> None:
+            calls.append({"source": source, "target": target})
+
+        with patch.object(handler, "_verify_rsync_available"):
+            with patch.object(handler, "_run_rsync", side_effect=fake_run_rsync):
+                handler.push()
+
+        assert len(calls) == 1
+        # The single call is the planning leg.
+        assert calls[0]["source"] == handler.planning_path
+        assert calls[0]["target"] == handler.gdrive_repo_path
+
+    # -- Pull memory leg tests ------------------------------------------------
+
+    def test_pull_calls_rsync_twice_when_gdrive_memory_exists(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """pull() invokes _run_rsync twice when the GDrive memory path exists."""
+        monkeypatch.setattr(
+            "projctl.handlers.sync._claude_projects_root",
+            lambda: tmp_path / ".claude" / "projects",
+        )
+        handler = self._make_bare_handler_with_memory(tmp_path, memory_present=False)
+        # Make the gdrive_repo_path exist so pull() doesn't raise.
+        handler.paths.gdrive_repo_path.mkdir(parents=True, exist_ok=True)
+
+        calls: list[dict] = []
+
+        def fake_run_rsync(source: Path, target: Path, description: str, **kwargs) -> None:
+            calls.append({"source": source, "target": target, "kwargs": kwargs})
+
+        gdrive_mem = tmp_path / "gdrive-mem-exists"
+        gdrive_mem.mkdir(parents=True, exist_ok=True)
+
+        with patch.object(handler, "_verify_rsync_available"):
+            with patch.object(handler, "_run_rsync", side_effect=fake_run_rsync):
+                # Simulate GDrive memory directory existing.
+                with patch.object(
+                    type(handler), "gdrive_memory_path", new_callable=lambda: property(
+                        lambda self: gdrive_mem
+                    )
+                ):
+                    handler.pull()
+
+        assert len(calls) == 2
+        # Planning leg is first, memory leg is second.
+        assert calls[0]["source"] == handler.gdrive_repo_path
+        assert calls[0]["target"] == handler.planning_path
+        assert calls[1]["source"] == gdrive_mem
+        second_call_excludes = calls[1]["kwargs"].get("excludes")
+        assert second_call_excludes == _MEMORY_RSYNC_EXCLUDES
+
+    def test_pull_calls_rsync_once_when_gdrive_memory_absent(self, tmp_path: Path) -> None:
+        """pull() invokes _run_rsync only once when GDrive memory path is absent."""
+        handler = self._make_bare_handler_with_memory(tmp_path, memory_present=False)
+        handler.paths.gdrive_repo_path.mkdir(parents=True, exist_ok=True)
+
+        calls: list[dict] = []
+
+        def fake_run_rsync(source: Path, target: Path, description: str, **kwargs) -> None:
+            calls.append({"source": source, "target": target})
+
+        with patch.object(handler, "_verify_rsync_available"):
+            with patch.object(handler, "_run_rsync", side_effect=fake_run_rsync):
+                # gdrive_memory_path points to a path that does not exist.
+                handler.pull()
+
+        assert len(calls) == 1
+        # The single call is the planning leg.
+        assert calls[0]["source"] == handler.gdrive_repo_path
+        assert calls[0]["target"] == handler.planning_path
+
+    # -- Dry-run push includes memory leg ------------------------------------
+
+    def test_push_dry_run_includes_memory_leg(self, tmp_path: Path) -> None:
+        """In dry-run mode, push() still calls _run_rsync twice when memory is present."""
+        handler = self._make_bare_handler_with_memory(tmp_path, memory_present=True)
+        handler.dry_run = True
+
+        calls: list[dict] = []
+
+        def fake_run_rsync(source: Path, target: Path, description: str, **kwargs) -> None:
+            calls.append({"source": source, "target": target, "kwargs": kwargs})
+
+        with patch.object(handler, "_verify_rsync_available"):
+            with patch.object(handler, "_run_rsync", side_effect=fake_run_rsync):
+                handler.push()
+
+        assert len(calls) == 2
+        # Planning leg is first, memory leg is second.
+        assert calls[0]["source"] == handler.planning_path
+        assert calls[0]["target"] == handler.gdrive_repo_path
+        assert calls[1]["source"] == handler.memory_path
+        assert calls[1]["target"] == handler.gdrive_memory_path
+
+    # -- _print_memory_status output tests ------------------------------------
+
+    def test_status_memory_section_both_absent(self, tmp_path: Path) -> None:
+        """When neither local nor GDrive memory exists, output contains 'nothing to sync'."""
+        handler = self._make_bare_handler_with_memory(tmp_path, memory_present=False)
+        # gdrive_memory_path does not exist (default in bare handler).
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            handler._print_memory_status()
+
+        assert "nothing to sync" in buf.getvalue()
+
+    def test_status_memory_section_local_only(self, tmp_path: Path) -> None:
+        """When only local memory exists, output contains 'local-ahead'."""
+        handler = self._make_bare_handler_with_memory(tmp_path, memory_present=True)
+        # gdrive_memory_path does not exist.
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            handler._print_memory_status()
+
+        assert "local-ahead" in buf.getvalue()
+
+    def test_status_memory_section_remote_only(self, tmp_path: Path) -> None:
+        """When only GDrive memory exists, output contains 'remote-ahead'."""
+        handler = self._make_bare_handler_with_memory(tmp_path, memory_present=False)
+
+        # Create the gdrive_memory_path so it appears to exist.
+        gdrive_mem = tmp_path / "gdrive" / "backup" / "claude-memory" / "-tmp-repo"
+        gdrive_mem.mkdir(parents=True, exist_ok=True)
+        # Update the path in _SyncPaths to point to the created directory.
+        handler.paths = _SyncPaths(
+            planning_path=handler.paths.planning_path,
+            gdrive_base=handler.paths.gdrive_base,
+            gdrive_planning_base=handler.paths.gdrive_planning_base,
+            gdrive_repo_path=handler.paths.gdrive_repo_path,
+            memory_path=None,
+            gdrive_memory_path=gdrive_mem,
+        )
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            handler._print_memory_status()
+
+        assert "remote-ahead" in buf.getvalue()
+
+    # -- [T5] "both present" branch — uses real rsync -------------------------
+
+    def _make_handler_with_both_memory_dirs(
+        self, tmp_path: Path, repo: Path
+    ) -> tuple["PlanningSyncHandler", Path, Path]:
+        """Create a real handler (via PlanningSyncHandler.__init__) with both memory dirs.
+
+        Returns (handler, local_memory_dir, gdrive_memory_dir).
+        """
+        planning = repo / "planning"
+        planning.mkdir(exist_ok=True)
+        gdrive_base = tmp_path / "gdrive"
+        gdrive_base.mkdir(exist_ok=True)
+
+        config = _make_config(tmp_path, gdrive_base)
+
+        orig_cwd = os.getcwd()
+        os.chdir(str(repo))
+        try:
+            handler = PlanningSyncHandler(config)
+        finally:
+            os.chdir(orig_cwd)
+
+        return handler, handler.paths.gdrive_base, handler.paths.gdrive_memory_path
+
+    def _make_memory_env(self, tmp_path: Path) -> tuple["PlanningSyncHandler", Path, Path]:
+        """Bootstrap a fake git repo and handler with memory dirs accessible."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", str(repo)], capture_output=True, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=str(repo),
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=str(repo),
+            capture_output=True,
+            check=True,
+        )
+
+        planning = repo / "planning"
+        planning.mkdir()
+        gdrive_base = tmp_path / "gdrive"
+        gdrive_base.mkdir()
+
+        config = _make_config(tmp_path, gdrive_base)
+
+        orig_cwd = os.getcwd()
+        os.chdir(str(repo))
+        try:
+            handler = PlanningSyncHandler(config)
+        finally:
+            os.chdir(orig_cwd)
+
+        # Derive the memory paths from what the handler computed.
+        local_mem = handler.paths.gdrive_base.parent  # not the memory — use repo root
+        local_mem = handler.gdrive_memory_path  # gdrive side
+        # The local memory path is ~/.claude/projects/<encoded-repo>/memory — we need to
+        # create it and register it on the handler directly for test purposes.
+        local_memory = tmp_path / "local-memory"
+        local_memory.mkdir()
+        gdrive_memory = tmp_path / "gdrive" / "backup" / "claude-memory" / "test-repo"
+        gdrive_memory.mkdir(parents=True, exist_ok=True)
+
+        # Override the paths dataclass fields with test-local directories.
+        handler.paths = _SyncPaths(
+            planning_path=handler.paths.planning_path,
+            gdrive_base=handler.paths.gdrive_base,
+            gdrive_planning_base=handler.paths.gdrive_planning_base,
+            gdrive_repo_path=handler.paths.gdrive_repo_path,
+            memory_path=local_memory,
+            gdrive_memory_path=gdrive_memory,
+        )
+        return handler, local_memory, gdrive_memory
+
+    @pytest.mark.integration
+    def test_status_memory_section_both_in_sync(self, tmp_path: Path) -> None:
+        """Both memory dirs exist with identical content → 'Memory STATUS: in-sync'."""
+        handler, local_memory, gdrive_memory = self._make_memory_env(tmp_path)
+
+        # Write identical file in both dirs.
+        _write_file(local_memory / "MEMORY.md", "# memory\nsome content\n")
+        _write_file(gdrive_memory / "MEMORY.md", "# memory\nsome content\n")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            handler._print_memory_status()
+
+        assert "Memory STATUS: in-sync" in buf.getvalue()
+
+    @pytest.mark.integration
+    def test_status_memory_section_both_local_ahead(self, tmp_path: Path) -> None:
+        """Local memory has a file GDrive does not → 'Memory STATUS: local-ahead' + filename."""
+        handler, local_memory, gdrive_memory = self._make_memory_env(tmp_path)
+
+        # Only local has a file.
+        _write_file(local_memory / "extra.md", "local-only note\n")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            handler._print_memory_status()
+
+        output = buf.getvalue()
+        assert "Memory STATUS: local-ahead" in output
+        assert "extra.md" in output
+
+    # -- [T6] PlatformError fallback in _print_memory_status ------------------
+
+    def test_status_memory_section_rsync_error_is_nonfatal(self, tmp_path: Path) -> None:
+        """_print_memory_status does not raise when _rsync_itemize raises PlatformError."""
+        handler, local_memory, gdrive_memory = self._make_memory_env(tmp_path)
+        # Both dirs exist so the rsync itemize branch is entered.
+        _write_file(local_memory / "a.md", "x")
+        _write_file(gdrive_memory / "a.md", "x")
+
+        def exploding_itemize(source: Path, target: Path, **kwargs) -> list:
+            raise PlatformError("boom")
+
+        buf = io.StringIO()
+        with patch.object(handler, "_rsync_itemize", side_effect=exploding_itemize):
+            with redirect_stdout(buf):
+                # Must not raise.
+                handler._print_memory_status()
+
+        assert "Memory: status check failed" in buf.getvalue()
+        assert "boom" in buf.getvalue()
+
+    # -- [T3] Planning succeeds, memory leg fails ------------------------------
+
+    def test_push_memory_leg_failure_propagates(self, tmp_path: Path) -> None:
+        """push() propagates PlatformError from the memory leg after planning succeeds."""
+        handler = self._make_bare_handler_with_memory(tmp_path, memory_present=True)
+        printed: list[str] = []
+        call_count = [0]
+
+        def fake_run_rsync(source: Path, target: Path, description: str, **kwargs) -> None:
+            call_count[0] += 1
+            if call_count[0] == 2:
+                raise PlatformError("memory rsync failed")
+
+        buf = io.StringIO()
+        with patch.object(handler, "_verify_rsync_available"):
+            with patch.object(handler, "_run_rsync", side_effect=fake_run_rsync):
+                with redirect_stdout(buf):
+                    with pytest.raises(PlatformError, match="memory rsync failed"):
+                        handler.push()
+
+        # Planning success print must have appeared before the exception.
+        assert "✓ Pushed" in buf.getvalue() and "planning" in buf.getvalue()
+
+    def test_pull_memory_leg_failure_propagates(self, tmp_path: Path, monkeypatch) -> None:
+        """pull() propagates PlatformError from the memory leg after planning succeeds."""
+        monkeypatch.setattr(
+            "projctl.handlers.sync._claude_projects_root",
+            lambda: tmp_path / ".claude" / "projects",
+        )
+        handler = self._make_bare_handler_with_memory(tmp_path, memory_present=False)
+        handler.paths.gdrive_repo_path.mkdir(parents=True, exist_ok=True)
+        call_count = [0]
+
+        def fake_run_rsync(source: Path, target: Path, description: str, **kwargs) -> None:
+            call_count[0] += 1
+            if call_count[0] == 2:
+                raise PlatformError("memory rsync failed")
+
+        gdrive_mem = tmp_path / "gdrive-mem-exists"
+        gdrive_mem.mkdir(parents=True, exist_ok=True)
+
+        buf = io.StringIO()
+        with patch.object(handler, "_verify_rsync_available"):
+            with patch.object(handler, "_run_rsync", side_effect=fake_run_rsync):
+                with patch.object(
+                    type(handler), "gdrive_memory_path", new_callable=lambda: property(
+                        lambda self: gdrive_mem
+                    )
+                ):
+                    with redirect_stdout(buf):
+                        with pytest.raises(PlatformError, match="memory rsync failed"):
+                            handler.pull()
+
+        # Planning success print must have appeared before the exception.
+        assert "✓ Pulled" in buf.getvalue() and "planning" in buf.getvalue()
+
+    # -- CR-4: oracle correctness — pull direction uses delete=False ----------
+
+    @pytest.mark.integration
+    def test_status_memory_pull_direction_is_additive_oracle(self, tmp_path: Path) -> None:
+        """_print_memory_status() uses delete=False for the pull-direction _rsync_itemize call.
+
+        Local memory has a.md; GDrive memory has b.md.  Because pull() is
+        additive (delete=False), a pull would never delete a.md — and the
+        oracle must not report it as a pull-delete candidate either.
+        """
+        handler, local_memory, gdrive_memory = self._make_memory_env(tmp_path)
+        _write_file(local_memory / "a.md", "local content")
+        _write_file(gdrive_memory / "b.md", "remote content")
+
+        itemize_calls: list[dict] = []
+        original_itemize = handler._rsync_itemize
+
+        def spy_itemize(source: Path, target: Path, **kwargs) -> list:
+            itemize_calls.append({"source": source, "target": target, "kwargs": kwargs})
+            return original_itemize(source, target, **kwargs)
+
+        buf = io.StringIO()
+        with patch.object(handler, "_rsync_itemize", side_effect=spy_itemize):
+            with redirect_stdout(buf):
+                handler._print_memory_status()
+
+        output = buf.getvalue()
+        # Memory section must be present (both dirs exist and differ).
+        assert "Memory STATUS:" in output
+
+        # Identify pull-direction call: source is gdrive_memory, target is local_memory.
+        pull_calls = [
+            c for c in itemize_calls if c["source"] == gdrive_memory
+        ]
+        assert pull_calls, "No pull-direction _rsync_itemize call was recorded"
+        for call in pull_calls:
+            assert call["kwargs"].get("delete") is False, (
+                "Pull-direction _rsync_itemize must use delete=False to match pull() behavior"
+            )
+
+        # a.md is local-only; because delete=False the oracle must not list it
+        # under any "would be deleted" section for the pull direction.
+        assert "Local files a pull would DELETE" not in output
+
+    # -- [C2] CLI exit code when memory leg fails ------------------------------
+
+    def test_cmd_sync_push_returns_1_when_memory_fails(self, tmp_path: Path) -> None:
+        """cmd_sync returns 1 when push() raises PlatformError (e.g. memory leg failure)."""
+        config_data: Dict[str, Any] = {
+            "platform": "gitlab",
+            "gitlab": {
+                "default_group": "test/group",
+                "labels": {"default": ["type::feature"]},
+            },
+            "planning_sync": {"gdrive_base": str(tmp_path / "gdrive")},
+        }
+        cfg = tmp_path / "config.yaml"
+        with open(cfg, "w", encoding="utf-8") as fh:
+            yaml.dump(config_data, fh)
+
+        args = argparse.Namespace(config=str(cfg), sync_command="push", dry_run=False)
+
+        with patch.object(PlanningSyncHandler, "__init__", lambda s, c, dry_run=False: None):
+            with patch.object(
+                PlanningSyncHandler,
+                "push",
+                side_effect=PlatformError("memory rsync failed"),
+            ):
+                rc = cmd_sync(args)
+
+        assert rc == 1
+
+    # -- [C3] status() line 1 remains STATUS: <state> after memory block ------
+
+    @pytest.mark.integration
+    def test_status_line1_is_planning_state_with_memory_drift(self, tmp_path: Path) -> None:
+        """Line 1 of status() output is 'STATUS: <state>', not a Memory line."""
+        handler, local_memory, gdrive_memory = self._make_memory_env(tmp_path)
+        # Set up planning as in-sync (no remote path yet → status will use tempdir).
+        # Local memory has a file GDrive does not, so memory section shows local-ahead.
+        _write_file(local_memory / "drift.md", "local-only memory content")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            handler.status()
+
+        first_line = buf.getvalue().splitlines()[0]
+        assert first_line.startswith("STATUS: ")
+        assert "Memory" not in first_line

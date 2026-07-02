@@ -40,6 +40,38 @@ def _assert_exclude_shape(patterns: tuple[str, ...]) -> None:
 RSYNC_EXCLUDES: tuple[str, ...] = ("*.swp", "*~", ".DS_Store", ".workflow-safety.log", "memory")
 _assert_exclude_shape(RSYNC_EXCLUDES)
 
+# Memory sync uses all the same excludes except "memory" itself — when syncing
+# the memory directory we want its contents, not an exclusion of the directory.
+_MEMORY_RSYNC_EXCLUDES: tuple[str, ...] = tuple(p for p in RSYNC_EXCLUDES if p != "memory")
+_assert_exclude_shape(_MEMORY_RSYNC_EXCLUDES)
+
+
+def _encode_repo_path(repo_root: Path) -> str:
+    """Encode a repo root path to the Claude project directory name.
+
+    Claude Code names its per-project directory by replacing every '/' in the
+    absolute path with '-', including the leading '/'.
+
+    Example: /home/alice/projects/projctl → -home-alice-projects-projctl
+    """
+    return str(repo_root).replace("/", "-")
+
+
+def _claude_projects_root() -> Path:
+    """Return the Claude projects root directory.
+
+    Isolated as a function so tests can monkeypatch it.
+    """
+    return Path.home() / ".claude" / "projects"
+
+
+def _claude_memory_path(repo_root: Path) -> Path:
+    """Return the Claude project memory directory for the given repo root.
+
+    The directory may not exist if no memory has been written yet.
+    """
+    return _claude_projects_root() / _encode_repo_path(repo_root) / "memory"
+
 
 @dataclass(frozen=True)
 class ItemizeEntry:
@@ -132,6 +164,11 @@ class _SyncPaths:
     gdrive_base: Path
     gdrive_planning_base: Path
     gdrive_repo_path: Path
+    memory_path: Path | None = None  # None when the local memory dir does not exist
+    # Sentinel ensures bare _SyncPaths() construction never accidentally matches an existing path.
+    gdrive_memory_path: Path = field(
+        default_factory=lambda: Path("/nonexistent/__unset_gdrive_memory__")
+    )
 
 
 class PlanningSyncHandler:
@@ -172,11 +209,14 @@ class PlanningSyncHandler:
 
         gdrive_base_path = Path(os.path.expanduser(gdrive_base))
         gdrive_planning_base = gdrive_base_path / "backup" / "planning"
+        memory_src = _claude_memory_path(self.repo_root)
         self.paths = _SyncPaths(
             planning_path=self._get_planning_path(),
             gdrive_base=gdrive_base_path,
             gdrive_planning_base=gdrive_planning_base,
             gdrive_repo_path=gdrive_planning_base / self.repo_name,
+            memory_path=memory_src if memory_src.exists() else None,
+            gdrive_memory_path=gdrive_base_path / "backup" / "claude-memory" / _encode_repo_path(self.repo_root),
         )
 
     @property
@@ -198,6 +238,16 @@ class PlanningSyncHandler:
     def gdrive_repo_path(self) -> Path:
         """Google Drive path for this repository's planning folder."""
         return self.paths.gdrive_repo_path
+
+    @property
+    def memory_path(self) -> Path | None:
+        """Local Claude memory directory path, or None if it doesn't exist."""
+        return self.paths.memory_path
+
+    @property
+    def gdrive_memory_path(self) -> Path:
+        """GDrive path for this repository's Claude memory backup."""
+        return self.paths.gdrive_memory_path
 
     def _get_repo_root(self) -> Path:
         """Get the git repository root directory.
@@ -268,13 +318,29 @@ class PlanningSyncHandler:
                 "  macOS: brew install rsync (or use built-in version)"
             ) from err
 
-    def _run_rsync(self, source: Path, target: Path, description: str) -> None:
+    # pylint: disable=too-many-positional-arguments
+    # Each parameter maps to a distinct rsync option; a config object would
+    # obscure the call sites and make the safety distinction (delete=False on
+    # memory pull) harder to review.
+    def _run_rsync(
+        self,
+        source: Path,
+        target: Path,
+        description: str,
+        excludes: tuple[str, ...] = RSYNC_EXCLUDES,
+        delete: bool = True,
+    ) -> None:
         """Run rsync to synchronize directories.
 
         Args:
             source: Source directory path.
             target: Target directory path.
             description: Human-readable description of the operation.
+            excludes: Rsync exclude patterns to apply. Defaults to RSYNC_EXCLUDES.
+            delete: If True, pass --delete to rsync (last-write-wins). Set to
+                False for memory pull so that local-only memory files are not
+                destroyed — memory has no git backup and --delete would be
+                unrecoverable data loss.
 
         Raises:
             PlatformError: If rsync fails.
@@ -283,9 +349,11 @@ class PlanningSyncHandler:
         source_str = f"{source}/"
         target_str = f"{target}/"
 
-        # Build rsync command using the shared exclude constant for oracle parity
-        rsync_cmd = ["rsync", "-av", "--delete"]
-        for pat in RSYNC_EXCLUDES:
+        # Build rsync command using the provided exclude set for oracle parity
+        rsync_cmd = ["rsync", "-av"]
+        if delete:
+            rsync_cmd.append("--delete")
+        for pat in excludes:
             rsync_cmd.append(f"--exclude={pat}")
 
         if self.dry_run:
@@ -347,6 +415,23 @@ class PlanningSyncHandler:
             print(f"  Local:  {self.planning_path}")
             print(f"  Remote: {self.gdrive_repo_path}")
 
+        # Sync Claude project memory (private, excluded from git)
+        if self.memory_path is not None:
+            if not self.dry_run:
+                self.gdrive_memory_path.parent.mkdir(parents=True, exist_ok=True)
+            self._run_rsync(
+                source=self.memory_path,
+                target=self.gdrive_memory_path,
+                description=f"Push {self.repo_name} memory to Google Drive",
+                excludes=_MEMORY_RSYNC_EXCLUDES,
+            )
+            if not self.dry_run:
+                print(f"✓ Pushed {self.repo_name} memory to Google Drive")
+                print(f"  Local:  {self.memory_path}")
+                print(f"  Remote: {self.gdrive_memory_path}")
+        else:
+            logger.debug("No local memory directory found, skipping memory sync")
+
     def pull(self) -> None:
         """Pull planning folder from Google Drive to local.
 
@@ -389,7 +474,36 @@ class PlanningSyncHandler:
             print(f"  Remote: {self.gdrive_repo_path}")
             print(f"  Local:  {self.planning_path}")
 
-    def _rsync_itemize(self, source: Path, target: Path) -> list[ItemizeEntry]:
+        # Pull Claude project memory (if present on GDrive)
+        if self.gdrive_memory_path.exists():
+            # Compute the local memory path fresh — self.memory_path may be None
+            # if the directory didn't exist when the handler was initialised.
+            local_memory = _claude_memory_path(self.repo_root)
+            if not self.dry_run:
+                local_memory.mkdir(parents=True, exist_ok=True)
+            self._run_rsync(
+                source=self.gdrive_memory_path,
+                target=local_memory,
+                description=f"Pull {self.repo_name} memory from Google Drive",
+                excludes=_MEMORY_RSYNC_EXCLUDES,
+                # Preserve local-only memory files — memory has no git backup and
+                # --delete would silently destroy files that exist only on this machine.
+                delete=False,
+            )
+            if not self.dry_run:
+                print(f"✓ Pulled {self.repo_name} memory from Google Drive")
+                print(f"  Remote: {self.gdrive_memory_path}")
+                print(f"  Local:  {local_memory}")
+        else:
+            logger.debug("No memory backup found on Google Drive, skipping memory pull")
+
+    def _rsync_itemize(
+        self,
+        source: Path,
+        target: Path,
+        excludes: tuple[str, ...] = RSYNC_EXCLUDES,
+        delete: bool = True,
+    ) -> list[ItemizeEntry]:
         """Run rsync in dry-run itemize mode and return parsed entries.
 
         This is a read-only helper. It always passes -n to rsync so no files
@@ -399,6 +513,12 @@ class PlanningSyncHandler:
         Args:
             source: Source directory.
             target: Target directory.
+            excludes: Rsync exclude patterns to apply. Defaults to RSYNC_EXCLUDES.
+            delete: If True, pass --delete to rsync so the oracle reflects what
+                the corresponding mutating operation would delete. Set to False
+                for the memory pull direction, which mirrors pull()'s additive
+                behavior (delete=False) so the oracle does not report pull_deletes
+                that pull() would never actually perform.
 
         Returns:
             List of parsed ItemizeEntry objects from rsync output.
@@ -409,8 +529,10 @@ class PlanningSyncHandler:
         source_str = f"{source}/"
         target_str = f"{target}/"
 
-        cmd = ["rsync", "-avn", "--delete", "--itemize-changes"]
-        for pat in RSYNC_EXCLUDES:
+        cmd = ["rsync", "-avn", "--itemize-changes"]
+        if delete:
+            cmd.append("--delete")
+        for pat in excludes:
             cmd.append(f"--exclude={pat}")
         cmd.extend([source_str, target_str])
 
@@ -465,6 +587,57 @@ class PlanningSyncHandler:
             )
 
         raise PlatformError(f"rsync failed with exit code {rc}.\n" f"stderr: {stderr}")
+
+    def _print_memory_status(self) -> None:
+        """Print memory sync status below the planning report (non-fatal)."""
+        local_exists = self.memory_path is not None
+        remote_exists = self.gdrive_memory_path.exists()
+
+        if not local_exists and not remote_exists:
+            print("\nMemory: not present locally or on Google Drive — nothing to sync")
+            return
+
+        if local_exists and not remote_exists:
+            print("\nMemory STATUS: local-ahead")
+            print(f"  Local:  {self.memory_path}")
+            print("  Run 'projctl sync push' to create the GDrive backup.")
+            return
+
+        if not local_exists and remote_exists:
+            print("\nMemory STATUS: remote-ahead")
+            print(f"  Remote: {self.gdrive_memory_path}")
+            print("  Run 'projctl sync pull' to restore locally.")
+            return
+
+        # Both sides exist — compute real diff
+        try:
+            local_mem = self.memory_path
+            assert local_mem is not None  # guaranteed by local_exists guard above
+            push_entries = self._rsync_itemize(
+                local_mem, self.gdrive_memory_path,
+                excludes=_MEMORY_RSYNC_EXCLUDES,
+                # delete=True (default): correctly shows what push would delete on remote
+            )
+            pull_entries = self._rsync_itemize(
+                self.gdrive_memory_path, local_mem,
+                excludes=_MEMORY_RSYNC_EXCLUDES,
+                delete=False,  # mirrors pull() behavior: additive, never deletes local files
+            )
+            mem_class = self._classify_drift(push_entries, pull_entries)
+        except PlatformError as exc:
+            print(f"\nMemory: status check failed — {exc}")
+            return
+
+        print(f"\nMemory STATUS: {mem_class.state}")
+        if mem_class.state != "in-sync":
+            if mem_class.push_transfers:
+                print("  Local changes to push:")
+                for p in mem_class.push_transfers:
+                    print(f"    {p}")
+            if mem_class.pull_transfers:
+                print("  Remote changes to pull:")
+                for p in mem_class.pull_transfers:
+                    print(f"    {p}")
 
     def _classify_drift(
         self,
@@ -645,6 +818,7 @@ class PlanningSyncHandler:
         classification = self._classify_drift(push_entries, pull_entries)
         print(self._format_status_report(classification))
         sys.stdout.flush()
+        self._print_memory_status()
 
 
 @dataclass(frozen=True)
