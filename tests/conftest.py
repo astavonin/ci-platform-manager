@@ -2,11 +2,13 @@
 
 import tempfile
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, Mock
 
 import pytest
 import yaml
+
+from projctl.config import Config
 
 
 @pytest.fixture
@@ -314,3 +316,24 @@ def mock_glab_mr_view() -> str:
         "pipeline": {"status": "success"},
         "web_url": "https://gitlab.example.com/test/project/-/merge_requests/134"
     }"""
+
+
+@pytest.fixture
+def make_mr_config():
+    """Factory fixture for a MagicMock Config with MR-relevant methods stubbed."""
+
+    def _factory(
+        default_reviewers: Optional[List[str]] = None,
+        required_fields: Optional[List[str]] = None,
+        required_sections: Optional[List[str]] = None,
+    ) -> MagicMock:
+        mock = MagicMock(spec=Config)
+        mock.get_default_mr_reviewers.return_value = default_reviewers or []
+        mock.get_required_mr_fields.return_value = required_fields or []
+        mock.get_required_mr_sections.return_value = (
+            required_sections
+            or ["Summary", "Implementation Details", "How It Was Tested"]
+        )
+        return mock
+
+    return _factory

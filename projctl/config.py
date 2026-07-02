@@ -334,6 +334,29 @@ class Config:
         _warn_unknown_fields(fields, _KNOWN_MR_FIELDS, "mr_template")
         return list(fields)
 
+    def get_default_mr_reviewers(self) -> List[str]:
+        """Return the list of reviewers always added to every MR/PR.
+
+        Returns [] when the 'reviewers' key is absent or empty.
+
+        Raises:
+            ConfigurationError: If reviewers is not a list of strings.
+        """
+        mr_template = self.get_common_config().get("mr_template", {})
+        reviewers = mr_template.get("reviewers", [])
+        if not reviewers:
+            return []
+        if not isinstance(reviewers, list):
+            raise ConfigurationError(
+                f"mr_template.reviewers must be a list of usernames, "
+                f"got {type(reviewers).__name__!r}"
+            )
+        if not all(isinstance(r, str) for r in reviewers):
+            raise ConfigurationError(
+                "mr_template.reviewers must be a list of strings (usernames)"
+            )
+        return list(reviewers)
+
     def get_default_group(self) -> Optional[str]:
         """Get the default GitLab group path for epic operations.
 

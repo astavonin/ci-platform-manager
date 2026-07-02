@@ -950,6 +950,103 @@ class TestGetRequiredFields:
 
 
 # ---------------------------------------------------------------------------
+# TestGetDefaultMrReviewers
+# ---------------------------------------------------------------------------
+
+
+class TestGetDefaultMrReviewers:
+    """Tests for Config.get_default_mr_reviewers()."""
+
+    def test_absent_reviewers_returns_empty(self, temp_dir: Path) -> None:
+        """No mr_template.reviewers key → []."""
+        # Arrange
+        config_data = {
+            "platform": "gitlab",
+            "gitlab": {"default_group": "test/group"},
+            "common": {"mr_template": {"required_sections": ["Summary"]}},
+        }
+        config_path = temp_dir / "config.yaml"
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(config_data, f)
+
+        # Act
+        config = Config(config_path)
+
+        # Assert
+        assert config.get_default_mr_reviewers() == []
+
+    def test_empty_reviewers_returns_empty(self, temp_dir: Path) -> None:
+        """mr_template.reviewers: [] → []."""
+        # Arrange
+        config_data = {
+            "platform": "gitlab",
+            "gitlab": {"default_group": "test/group"},
+            "common": {"mr_template": {"reviewers": []}},
+        }
+        config_path = temp_dir / "config.yaml"
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(config_data, f)
+
+        # Act
+        config = Config(config_path)
+
+        # Assert
+        assert config.get_default_mr_reviewers() == []
+
+    def test_configured_reviewers_returned(self, temp_dir: Path) -> None:
+        """mr_template.reviewers: [alice, bob] → ['alice', 'bob']."""
+        # Arrange
+        config_data = {
+            "platform": "gitlab",
+            "gitlab": {"default_group": "test/group"},
+            "common": {"mr_template": {"reviewers": ["alice", "bob"]}},
+        }
+        config_path = temp_dir / "config.yaml"
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(config_data, f)
+
+        # Act
+        config = Config(config_path)
+
+        # Assert
+        assert config.get_default_mr_reviewers() == ["alice", "bob"]
+
+    def test_non_list_raises_configuration_error(self, temp_dir: Path) -> None:
+        """mr_template.reviewers: 'alice' (scalar) → ConfigurationError."""
+        # Arrange
+        config_data = {
+            "platform": "gitlab",
+            "gitlab": {"default_group": "test/group"},
+            "common": {"mr_template": {"reviewers": "alice"}},
+        }
+        config_path = temp_dir / "config.yaml"
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(config_data, f)
+
+        # Act / Assert
+        config = Config(config_path)
+        with pytest.raises(ConfigurationError, match="mr_template.reviewers must be a list"):
+            config.get_default_mr_reviewers()
+
+    def test_non_string_element_raises_configuration_error(self, temp_dir: Path) -> None:
+        """mr_template.reviewers: [123] (non-string element) → ConfigurationError."""
+        # Arrange
+        config_data = {
+            "platform": "gitlab",
+            "gitlab": {"default_group": "test/group"},
+            "common": {"mr_template": {"reviewers": [123]}},
+        }
+        config_path = temp_dir / "config.yaml"
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(config_data, f)
+
+        # Act / Assert
+        config = Config(config_path)
+        with pytest.raises(ConfigurationError, match="mr_template.reviewers must be a list of strings"):
+            config.get_default_mr_reviewers()
+
+
+# ---------------------------------------------------------------------------
 # TestConfigSearchPaths
 # ---------------------------------------------------------------------------
 

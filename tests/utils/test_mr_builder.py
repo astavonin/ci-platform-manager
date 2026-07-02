@@ -1,10 +1,12 @@
 """Tests for projctl.utils.mr_builder module."""
 
+import logging
 import types
 from unittest.mock import Mock
 
 import pytest
 
+from projctl.config import ConfigurationError
 from projctl.utils.mr_builder import append_common_mr_flags, validate_mr_args
 
 
@@ -23,15 +25,18 @@ def _args(**kwargs) -> types.SimpleNamespace:
     return types.SimpleNamespace(**defaults)
 
 
-def _config(mr_sections=None, mr_fields=None) -> Mock:
+def _config(mr_sections=None, mr_fields=None, default_reviewers=None) -> Mock:
     """Build a mock Config that returns the given MR required sections and required fields."""
     if mr_sections is None:
         mr_sections = ["Summary", "Implementation Details", "How It Was Tested"]
     if mr_fields is None:
         mr_fields = []
+    if default_reviewers is None:
+        default_reviewers = []
     mock = Mock()
     mock.get_required_mr_sections.return_value = mr_sections
     mock.get_required_mr_fields.return_value = mr_fields
+    mock.get_default_mr_reviewers.return_value = default_reviewers
     return mock
 
 
@@ -271,3 +276,123 @@ class TestValidateMrArgsRequiredFields:
 
         # Act / Assert — no exception; fill early-returns before any check
         validate_mr_args(args, config)
+
+
+class TestMergeDefaultReviewers:
+    """Tests for _merge_default_reviewers behaviour via validate_mr_args.
+
+    Each test provides a valid title and description (or uses fill=True) so
+    that the reviewer-merge assertions are not shadowed by an earlier
+    title/description validation error.
+    """
+
+    def test_no_defaults_no_cli_reviewer_stays_none(self) -> None:
+        """No config defaults, no CLI reviewer → args.reviewer remains None."""
+        # Arrange
+        args = _args(title="My MR", description=_VALID_DESCRIPTION, reviewer=None)
+        config = _config(default_reviewers=[])
+
+        # Act
+        validate_mr_args(args, config)
+
+        # Assert
+        assert args.reviewer is None
+
+    def test_defaults_only_merged_into_args(self) -> None:
+        """Config default=[alice], no CLI reviewer → args.reviewer == ['alice']."""
+        # Arrange
+        args = _args(title="My MR", description=_VALID_DESCRIPTION, reviewer=[])
+        config = _config(default_reviewers=["alice"])
+
+        # Act
+        validate_mr_args(args, config)
+
+        # Assert
+        assert args.reviewer == ["alice"]
+
+    def test_cli_only_preserved(self) -> None:
+        """No config defaults, CLI=[bob] → args.reviewer == ['bob']."""
+        # Arrange
+        args = _args(title="My MR", description=_VALID_DESCRIPTION, reviewer=["bob"])
+        config = _config(default_reviewers=[])
+
+        # Act
+        validate_mr_args(args, config)
+
+        # Assert
+        assert args.reviewer == ["bob"]
+
+    def test_cli_and_defaults_merged_cli_first(self) -> None:
+        """Config default=[alice], CLI=[bob] → args.reviewer == ['bob', 'alice']."""
+        # Arrange
+        args = _args(title="My MR", description=_VALID_DESCRIPTION, reviewer=["bob"])
+        config = _config(default_reviewers=["alice"])
+
+        # Act
+        validate_mr_args(args, config)
+
+        # Assert — CLI reviewer (bob) comes first, then config default (alice)
+        assert args.reviewer == ["bob", "alice"]
+
+    def test_duplicate_reviewer_deduplicated(self) -> None:
+        """Config default=[alice], CLI=[alice] → args.reviewer == ['alice'] (no duplicate)."""
+        # Arrange
+        args = _args(title="My MR", description=_VALID_DESCRIPTION, reviewer=["alice"])
+        config = _config(default_reviewers=["alice"])
+
+        # Act
+        validate_mr_args(args, config)
+
+        # Assert
+        assert args.reviewer == ["alice"]
+
+    def test_defaults_satisfy_required_reviewers_check(self) -> None:
+        """required_fields=['reviewers'], no CLI reviewer but defaults=[alice] → no ValueError."""
+        # Arrange
+        args = _args(title="My MR", description=_VALID_DESCRIPTION, reviewer=[])
+        config = _config(mr_fields=["reviewers"], default_reviewers=["alice"])
+
+        # Act / Assert — merge must happen before the required_fields check
+        validate_mr_args(args, config)
+        assert args.reviewer == ["alice"]
+
+    def test_fill_flag_still_adds_default_reviewers(self) -> None:
+        """--fill set, defaults=[alice] → args.reviewer == ['alice'] (merge before fill bypass)."""
+        # Arrange — fill=True skips title/description checks, so no title needed
+        args = _args(fill=True, reviewer=[])
+        config = _config(default_reviewers=["alice"])
+
+        # Act
+        validate_mr_args(args, config)
+
+        # Assert — merge happens before the early return for --fill
+        assert args.reviewer == ["alice"]
+
+    def test_config_error_in_get_default_mr_reviewers_logs_warning(self, caplog) -> None:
+        """ConfigurationError from get_default_mr_reviewers is caught and logged as warning."""
+        # Arrange
+        config = _config()
+        config.get_default_mr_reviewers.side_effect = ConfigurationError("bad config")
+        args = _args(title="My MR", description=_VALID_DESCRIPTION, reviewer=["bob"])
+
+        # Act — must not raise
+        with caplog.at_level(logging.WARNING, logger="projctl.utils.mr_builder"):
+            validate_mr_args(args, config)
+
+        # Assert — reviewer is unchanged and the error is logged at WARNING level
+        assert args.reviewer == ["bob"]
+        assert "Skipping default MR reviewers" in caplog.text
+
+    def test_multiple_defaults_multiple_cli_order_preserved(self) -> None:
+        """CLI=[bob, carol], defaults=[alice, bob] → ['bob', 'carol', 'alice'] (bob deduped)."""
+        # Arrange
+        args = _args(
+            title="My MR", description=_VALID_DESCRIPTION, reviewer=["bob", "carol"]
+        )
+        config = _config(default_reviewers=["alice", "bob"])
+
+        # Act
+        validate_mr_args(args, config)
+
+        # Assert — CLI order first, then new defaults in their config order
+        assert args.reviewer == ["bob", "carol", "alice"]

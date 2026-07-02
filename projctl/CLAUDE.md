@@ -109,6 +109,17 @@ common:
     required_sections:
       - "Description"
       - "Acceptance Criteria"
+  mr_template:
+    required_sections:
+      - "Summary"
+      - "Implementation Details"
+      - "How It Was Tested"
+    required_fields:
+      - "reviewers"    # enforce: at least one reviewer specified (CLI or default)
+      - "labels"       # enforce: at least one label
+    reviewers:         # always added to every MR/PR; merged with --reviewer (deduplicated)
+      - alice
+      - bob
 
 # Planning sync settings
 planning_sync:
