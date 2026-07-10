@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import Config
 from ..exceptions import PlatformError
+from ..utils.validation import validate_labels
 from .loader import TicketLoader
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,11 @@ class TicketUpdater:
         self.dry_run = dry_run
         # Reuse loader for reference parsing, label fetching, and glab execution.
         self._loader = TicketLoader(config)
+
+    def _validate_labels_add(self, labels_add: Optional[List[str]]) -> None:
+        """Raise ValueError if any label in labels_add is not in the allowed list."""
+        if labels_add:
+            validate_labels(labels_add, self.config.get_allowed_labels())
 
     def _fetch_and_merge_labels(
         self,
@@ -336,6 +342,8 @@ class TicketUpdater:
             PlatformError: If the update fails.
             ValueError: If the issue reference cannot be parsed.
         """
+        self._validate_labels_add(labels_add)
+
         # pylint: disable=protected-access
         # TicketLoader's reference-parsing methods are internal helpers shared
         # between sibling handler classes; no public API exists for them.
@@ -448,6 +456,8 @@ class TicketUpdater:
             PlatformError: If the update fails.
             ValueError: If the MR reference cannot be parsed.
         """
+        self._validate_labels_add(labels_add)
+
         project_path, iid = self._parse_mr_reference(mr_ref)
 
         if project_path:
@@ -526,6 +536,8 @@ class TicketUpdater:
             PlatformError: If the update fails.
             ValueError: If the epic reference cannot be parsed or group is unavailable.
         """
+        self._validate_labels_add(labels_add)
+
         # pylint: disable=protected-access
         # TicketLoader's reference-parsing methods are internal helpers shared
         # between sibling handler classes; no public API exists for them.

@@ -115,7 +115,7 @@ class TestUpdateIssue:
         config = Config(new_config_path)
         updater = TicketUpdater(config)
 
-        updater.update_issue("231", labels_add=["type::fix"], labels_remove=["type::feature"])
+        updater.update_issue("231", labels_add=["type::bug"], labels_remove=["type::feature"])
 
         assert mock_run.call_count == 2
         # Second call (PUT) should contain the merged label set.
@@ -125,7 +125,7 @@ class TestUpdateIssue:
         assert label_fields, "Expected labels field in PUT call"
         label_value = label_fields[0][len("labels=") :]
         label_set = set(label_value.split(","))
-        assert "type::fix" in label_set
+        assert "type::bug" in label_set
         assert "keep" in label_set
         assert "type::feature" not in label_set
 
@@ -150,7 +150,7 @@ class TestUpdateIssue:
         config = Config(new_config_path)
         updater = TicketUpdater(config, dry_run=True)
 
-        updater.update_issue("231", labels_add=["type::fix"], labels_remove=["type::feature"])
+        updater.update_issue("231", labels_add=["type::bug"], labels_remove=["type::feature"])
 
         mock_run.assert_not_called()
         captured = capsys.readouterr()
@@ -222,6 +222,37 @@ class TestUpdateIssue:
         assert any("milestone_id=99" in f for f in fields)
 
 
+    def test_update_issue_invalid_label_raises(self, new_config_path: Path) -> None:
+        """labels_add containing a label not in the allowed list raises ValueError."""
+        config = Config(new_config_path)
+        updater = TicketUpdater(config)
+
+        with pytest.raises(ValueError, match="Unknown labels"):
+            updater.update_issue("231", labels_add=["not-allowed::label"])
+
+    def test_update_issue_invalid_label_raises_in_dry_run(self, new_config_path: Path) -> None:
+        """Label validation fires before dry-run output — bad labels fail even with dry_run=True."""
+        config = Config(new_config_path)
+        updater = TicketUpdater(config, dry_run=True)
+
+        with pytest.raises(ValueError, match="Unknown labels"):
+            updater.update_issue("231", labels_add=["not-allowed::label"])
+
+    @patch("subprocess.run")
+    def test_update_issue_valid_label_does_not_raise(
+        self, mock_run: Mock, new_config_path: Path
+    ) -> None:
+        """labels_add containing only allowed labels proceeds without error."""
+        mock_run.side_effect = [
+            Mock(stdout='{"iid": 231, "labels": []}', stderr="", returncode=0),
+            Mock(stdout='{"iid": 231, "title": "T"}', stderr="", returncode=0),
+        ]
+        config = Config(new_config_path)
+        updater = TicketUpdater(config)
+
+        updater.update_issue("231", labels_add=["type::bug"])  # in allowed list — must not raise
+
+
 # ---------------------------------------------------------------------------
 # update_mr
 # ---------------------------------------------------------------------------
@@ -274,7 +305,7 @@ class TestUpdateMr:
         config = Config(new_config_path)
         updater = TicketUpdater(config)
 
-        updater.update_mr("144", labels_add=["type::fix"], labels_remove=["type::feature"])
+        updater.update_mr("144", labels_add=["type::bug"], labels_remove=["type::feature"])
 
         assert mock_run.call_count == 2
         put_args = mock_run.call_args_list[1][0][0]
@@ -282,7 +313,7 @@ class TestUpdateMr:
         label_fields = [f for f in fields if f.startswith("labels=")]
         assert label_fields
         label_set = set(label_fields[0][len("labels=") :].split(","))
-        assert "type::fix" in label_set
+        assert "type::bug" in label_set
         assert "type::feature" not in label_set
 
     @patch("subprocess.run")
@@ -306,7 +337,7 @@ class TestUpdateMr:
         config = Config(new_config_path)
         updater = TicketUpdater(config, dry_run=True)
 
-        updater.update_mr("144", labels_add=["type::fix"], labels_remove=["type::feature"])
+        updater.update_mr("144", labels_add=["type::bug"], labels_remove=["type::feature"])
 
         mock_run.assert_not_called()
         captured = capsys.readouterr()
@@ -371,6 +402,23 @@ class TestUpdateMr:
         assert ":id" not in endpoint_str
 
 
+    def test_update_mr_invalid_label_raises(self, new_config_path: Path) -> None:
+        """labels_add containing a disallowed label raises ValueError."""
+        config = Config(new_config_path)
+        updater = TicketUpdater(config)
+
+        with pytest.raises(ValueError, match="Unknown labels"):
+            updater.update_mr("144", labels_add=["not-allowed::label"])
+
+    def test_update_mr_invalid_label_raises_in_dry_run(self, new_config_path: Path) -> None:
+        """Label validation fires before dry-run output for MRs too."""
+        config = Config(new_config_path)
+        updater = TicketUpdater(config, dry_run=True)
+
+        with pytest.raises(ValueError, match="Unknown labels"):
+            updater.update_mr("144", labels_add=["not-allowed::label"])
+
+
 # ---------------------------------------------------------------------------
 # update_epic
 # ---------------------------------------------------------------------------
@@ -432,7 +480,7 @@ class TestUpdateEpic:
         config = Config(new_config_path)
         updater = TicketUpdater(config)
 
-        updater.update_epic("37", labels_add=["new"], labels_remove=["old"])
+        updater.update_epic("37", labels_add=["type::bug"], labels_remove=["old"])
 
         assert mock_run.call_count == 3
         put_args = mock_run.call_args_list[2][0][0]
@@ -440,7 +488,7 @@ class TestUpdateEpic:
         label_fields = [f for f in fields if f.startswith("labels=")]
         assert label_fields
         label_set = set(label_fields[0][len("labels=") :].split(","))
-        assert "new" in label_set
+        assert "type::bug" in label_set
         assert "epic" in label_set
         assert "old" not in label_set
 
@@ -465,7 +513,7 @@ class TestUpdateEpic:
         config = Config(new_config_path)
         updater = TicketUpdater(config, dry_run=True)
 
-        updater.update_epic("37", labels_add=["new"], labels_remove=["old"])
+        updater.update_epic("37", labels_add=["type::bug"], labels_remove=["old"])
 
         mock_run.assert_not_called()
         captured = capsys.readouterr()
@@ -573,6 +621,23 @@ class TestUpdateEpic:
         assert "DRY RUN" in captured.out
         assert "milestone_id" in captured.out
         assert "Sprint 1" in captured.out
+
+
+    def test_update_epic_invalid_label_raises(self, new_config_path: Path) -> None:
+        """labels_add containing a disallowed label raises ValueError for epics."""
+        config = Config(new_config_path)
+        updater = TicketUpdater(config)
+
+        with pytest.raises(ValueError, match="Unknown labels"):
+            updater.update_epic("37", labels_add=["not-allowed::label"])
+
+    def test_update_epic_invalid_label_raises_in_dry_run(self, new_config_path: Path) -> None:
+        """Label validation fires before dry-run output for epics."""
+        config = Config(new_config_path)
+        updater = TicketUpdater(config, dry_run=True)
+
+        with pytest.raises(ValueError, match="Unknown labels"):
+            updater.update_epic("37", labels_add=["not-allowed::label"])
 
 
 # ---------------------------------------------------------------------------
