@@ -1,16 +1,33 @@
-# CI Platform Manager
+# projctl
 
-Multi-platform CI automation tool for GitLab/GitHub workflow management.
+`projctl` is the operational CLI companion to [genai-automations](https://github.com/astavonin/genai-automations), a structured 8-phase AI-assisted development workflow where Claude Code orchestrates research, design, review, implementation, and verification through artifacts kept in a local `planning/` folder. `projctl` turns those artifacts into real work on GitLab or GitHub — creating tickets from design docs, posting review findings to merge requests, and keeping the `planning/` folder synchronized across machines.
 
-## Features
+## Why it exists
 
-- Create issues and epics from YAML with dependency tracking
-- Load issues, epics, milestones, and MRs
-- Search across issues, epics, and milestones
-- Create merge requests and post review comments
-- Display configured labels from the project config
-- OR group label validation — require exactly one label from a set per issue
-- Sync planning folders with Google Drive across machines
+- Review artifacts (`code-review.md`, `design-review.md`, decision records) need to reach GitLab or GitHub as inline MR comments and structured tickets — `projctl` is the bridge without leaving the terminal.
+- Ticket and MR operations are repetitive web-UI work that breaks flow; YAML-driven inputs remove the friction and make the operations reproducible.
+- The `planning/` folder is the workflow's persistent memory across session resets and machine switches — without sync it lives on one machine only, and the workflow loses continuity.
+- Every mutating operation has `--dry-run`, so workflow checkpoints are safe to explore before anything reaches the platform.
+
+## What it does
+
+### Ticket management
+
+Create issues and epics from YAML files that mirror the shape of the planning artifacts, so a design doc can drive ticket creation directly. Dependencies wire between issues in the same YAML and against existing tickets, load and search work across issues, epics, milestones, and MRs by short reference or URL, and update lets you change titles, labels, assignees, milestones, and states in bulk without touching the web UI.
+
+### MR workflow
+
+The `comment` command is the bridge between a `code-review.md` artifact and the actual merge request: it posts inline diff comments per finding, replies to and resolves discussion threads, and issues approve or unapprove — all from a single YAML file. `create-mr` opens the MR itself with template enforcement, so required sections and default reviewers are applied consistently across every submission.
+
+### Planning sync
+
+`projctl sync` rsyncs the local `./planning/` folder to Google Drive with drift detection: `sync status` reports `in-sync`, `local-ahead`, `remote-ahead`, or `diverged` before any files move, so switching machines starts from a known state. This is what keeps the workflow's persistent context alive across session resets — pull before starting work, push when finishing, and the same planning tree is available on the next machine.
+
+Utilities cover GitLab wiki management, CI pipeline failure log retrieval, label inspection, and configuration introspection.
+
+## Relationship to genai-automations
+
+`projctl` is designed to be used alongside [genai-automations](https://github.com/astavonin/genai-automations), not as a standalone tool. The two connect at three points: `projctl sync` keeps the `planning/` folder alive across sessions and machines so the workflow's persistent memory survives; `projctl comment` posts findings from `code-review.md` and `design-review.md` artifacts back to the MR being reviewed; and `projctl create` turns design artifacts into tickets and epics with the dependency structure the workflow expects.
 
 ## Installation
 
@@ -18,30 +35,43 @@ Multi-platform CI automation tool for GitLab/GitHub workflow management.
 pipx install git+https://github.com/astavonin/projctl.git
 ```
 
-**Development:**
+Development install (editable):
 
 ```bash
 git clone git@github.com:astavonin/projctl.git
 pipx install -e ./projctl
 ```
 
-## Usage
+## Configuration
 
-```bash
-projctl create --dry-run epic.yaml   # preview issue creation
-projctl create epic.yaml             # create issues
+Configuration is layered by purpose. Config file resolution: `./projctl.yaml` (project-local) then `~/.config/projctl/config.yaml` (user-wide), first found wins.
 
-projctl load issue 113   # load issue
-projctl load epic 21     # load epic
-projctl load mr 134      # load MR
+**Planning-only config.** If you only need `projctl sync`, a single field is enough — the path to your Google Drive mount:
 
-projctl search issues "streaming"
-
-projctl labels       # show configured labels (grouped by prefix)
-
-projctl sync status  # check drift state (read-only)
-projctl sync push    # push planning → Google Drive
-projctl sync pull    # pull Google Drive → planning
+```yaml
+planning_sync:
+  gdrive_base: ~/GoogleDrive
 ```
 
-See `CLAUDE.md` for full configuration reference, YAML format, and all commands.
+**Ticket and MR config.** For issue creation, MR posting, and everything that touches the platform, add the platform selection, the group or organization scope, the default labels applied to new issues, and the reviewers automatically added to every MR:
+
+```yaml
+platform: gitlab
+
+gitlab:
+  default_group: "my-group/my-project"
+  labels:
+    default: ["type::feature", "status::backlog"]
+
+common:
+  mr_template:
+    reviewers:
+      - alice
+      - bob
+```
+
+Run `projctl config` to see which config file is active and what the fully merged, resolved configuration looks like.
+
+---
+
+For command reference, see [CLAUDE.md](./CLAUDE.md).
