@@ -93,8 +93,8 @@ def _load_review_data(review_file: str) -> tuple:
     with open(review_file, "r", encoding="utf-8") as yaml_file:
         review_data = yaml.safe_load(yaml_file)
 
-    if "findings" not in review_data and "replies" not in review_data:
-        raise ValueError("Review YAML must contain 'findings' or 'replies' field")
+    if not any(k in review_data for k in ("findings", "replies", "resolve")):
+        raise ValueError("Review YAML must contain 'findings', 'replies', or 'resolve' field")
 
     approval = review_data.get("approval", DEFAULT_APPROVAL_STATUS)
     if approval not in VALID_APPROVAL_STATUSES:
@@ -315,6 +315,80 @@ def _post_replies(mr_number: int, replies: list, dry_run: bool) -> tuple:
     return posted, skipped, failed
 
 
+def _resolve_discussion(mr_number: int, discussion_id: str, dry_run: bool) -> Optional[bool]:
+    """Resolve (close) an MR discussion thread.
+
+    Args:
+        mr_number: The MR iid.
+        discussion_id: Full GitLab discussion SHA.
+        dry_run: If True, only print what would be done.
+
+    Returns:
+        True if resolved, None if already resolved, False on failure.
+    """
+    # Check current state first.
+    cmd_get = [
+        "glab", "api",
+        f"projects/:id/merge_requests/{mr_number}/discussions/{discussion_id}",
+        "--method", "GET",
+    ]
+    try:
+        result = subprocess.run(cmd_get, capture_output=True, text=True, check=True)
+        disc = json.loads(result.stdout)
+        if disc.get("resolved"):
+            logger.info("Discussion %s is already resolved, skipping", discussion_id[:12])
+            return None
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        pass  # proceed and attempt resolve anyway
+
+    if dry_run:
+        print(f"\n[DRY RUN] Would resolve discussion {discussion_id[:12]}")
+        return True
+
+    payload = {"resolved": True}
+    cmd_put = [
+        "glab", "api",
+        f"projects/:id/merge_requests/{mr_number}/discussions/{discussion_id}",
+        "--method", "PUT",
+        "--header", "Content-Type: application/json",
+        "--input", "-",
+    ]
+    try:
+        subprocess.run(cmd_put, input=json.dumps(payload), capture_output=True, text=True, check=True)
+        logger.info("✓ Resolved discussion %s", discussion_id[:12])
+        return True
+    except subprocess.CalledProcessError as err:
+        logger.error("Failed to resolve discussion %s: %s", discussion_id[:12], err.stderr)
+        return False
+
+
+def _resolve_discussions(mr_number: int, resolve_list: list, dry_run: bool) -> tuple:
+    """Resolve a list of MR discussion threads.
+
+    Args:
+        mr_number: The MR iid.
+        resolve_list: List of dicts with ``discussion_id`` keys.
+        dry_run: If True, only print what would be done.
+
+    Returns:
+        Tuple of (resolved_count, skipped_count, failed_count).
+    """
+    resolved, skipped, failed = 0, 0, 0
+    for entry in resolve_list:
+        discussion_id = entry.get("discussion_id", "")
+        if not discussion_id:
+            logger.warning("Resolve entry missing discussion_id, skipping")
+            continue
+        result = _resolve_discussion(mr_number, discussion_id, dry_run)
+        if result is None:
+            skipped += 1
+        elif result:
+            resolved += 1
+        else:
+            failed += 1
+    return resolved, skipped, failed
+
+
 def _post_inline_findings(
     mr_number: int,
     findings: list,
@@ -376,6 +450,7 @@ def _is_not_approved_error(stderr: str) -> bool:
         "not approved" in lowered
         or "user has not approved" in lowered
         or "cannot unapprove" in lowered
+        or "404" in lowered
     )
 
 
@@ -441,6 +516,24 @@ def _apply_approval_status(mr_number: int, approval: str, dry_run: bool) -> bool
     return _run_approve(mr_number)
 
 
+def _handle_resolve(mr_number: int, resolve_list: list, dry_run: bool) -> int:
+    """Resolve listed discussion threads and return 0/1 exit code."""
+    if not resolve_list:
+        return 0
+    res_resolved, res_skipped, res_failed = _resolve_discussions(mr_number, resolve_list, dry_run)
+    if dry_run:
+        print(
+            f"\n[DRY RUN] Resolve: {res_resolved} would resolve, "
+            f"{res_skipped} already resolved, {res_failed} failed — MR !{mr_number}"
+        )
+    else:
+        logger.info(
+            "✓ Resolve: %d resolved, %d skipped, %d failed on MR !%s",
+            res_resolved, res_skipped, res_failed, mr_number,
+        )
+    return 1 if res_failed else 0
+
+
 def _post_findings(mr_number: int, review_data: Dict[str, Any], dry_run: bool) -> int:
     """Post inline findings (or fall back to a general comment) and return 0/1 exit code."""
     findings = review_data.get("findings", [])
@@ -492,6 +585,9 @@ def cmd_comment(args) -> int:
             return 1
 
         exit_code = 0
+
+        if _handle_resolve(mr_number, review_data.get("resolve", []), args.dry_run):
+            exit_code = 1
 
         replies = review_data.get("replies", [])
         if replies:

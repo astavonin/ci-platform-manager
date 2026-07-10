@@ -13,12 +13,15 @@ from projctl.handlers.comment import (
     VALID_APPROVAL_STATUSES,
     _apply_approval_status,
     _fetch_mr_diff_lines,
+    _handle_resolve,
     _is_already_approved_error,
     _is_not_approved_error,
     _load_review_data,
     _parse_diff_lines,
     _parse_hunk_lines,
     _post_inline_findings,
+    _resolve_discussion,
+    _resolve_discussions,
     cmd_comment,
     post_inline_comment,
 )
@@ -671,3 +674,209 @@ class TestCmdCommentApprovalWiring:
         cmd_comment(self._make_args())
 
         mock_apply.assert_called_once_with(42, "approved", False)
+
+
+# ---------------------------------------------------------------------------
+# TestResolveDiscussion
+# ---------------------------------------------------------------------------
+
+
+class TestResolveDiscussion:
+    """Tests for _resolve_discussion."""
+
+    _DID = "abc123def456789"
+    _MR = 10
+
+    def _make_get_result(self, resolved: bool) -> MagicMock:
+        m = MagicMock()
+        m.stdout = json.dumps({"resolved": resolved})
+        return m
+
+    @patch(_PATCH_SUBPROCESS)
+    def test_already_resolved_returns_none(self, mock_run: MagicMock) -> None:
+        """When GET reports resolved=true, returns None without issuing PUT."""
+        mock_run.return_value = self._make_get_result(True)
+
+        result = _resolve_discussion(self._MR, self._DID, dry_run=False)
+
+        assert result is None
+        mock_run.assert_called_once()
+
+    @patch(_PATCH_SUBPROCESS)
+    def test_dry_run_skips_put(self, mock_run: MagicMock) -> None:
+        """In dry-run mode, only the GET is issued; no PUT."""
+        mock_run.return_value = self._make_get_result(False)
+
+        result = _resolve_discussion(self._MR, self._DID, dry_run=True)
+
+        assert result is True
+        mock_run.assert_called_once()
+
+    @patch(_PATCH_SUBPROCESS)
+    def test_successful_put_returns_true(self, mock_run: MagicMock) -> None:
+        """Happy path: GET says not resolved, PUT succeeds → True."""
+        mock_run.side_effect = [
+            self._make_get_result(False),
+            MagicMock(),
+        ]
+
+        result = _resolve_discussion(self._MR, self._DID, dry_run=False)
+
+        assert result is True
+        assert mock_run.call_count == 2
+
+    @patch(_PATCH_SUBPROCESS)
+    def test_put_failure_returns_false(self, mock_run: MagicMock) -> None:
+        """When PUT raises CalledProcessError, returns False."""
+        err = subprocess.CalledProcessError(1, "glab", stderr="server error")
+        mock_run.side_effect = [self._make_get_result(False), err]
+
+        result = _resolve_discussion(self._MR, self._DID, dry_run=False)
+
+        assert result is False
+
+    @patch(_PATCH_SUBPROCESS)
+    def test_get_error_still_attempts_put(self, mock_run: MagicMock) -> None:
+        """If GET fails, the function proceeds to attempt PUT anyway."""
+        err = subprocess.CalledProcessError(1, "glab", stderr="not found")
+        mock_run.side_effect = [err, MagicMock()]
+
+        result = _resolve_discussion(self._MR, self._DID, dry_run=False)
+
+        assert result is True
+        assert mock_run.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# TestResolveDiscussions
+# ---------------------------------------------------------------------------
+
+
+class TestResolveDiscussions:
+    """Tests for _resolve_discussions."""
+
+    @patch("projctl.handlers.comment._resolve_discussion")
+    def test_empty_list_returns_zeros(self, mock_resolve: MagicMock) -> None:
+        """Empty resolve list yields (0, 0, 0) without calling _resolve_discussion."""
+        resolved, skipped, failed = _resolve_discussions(1, [], dry_run=False)
+
+        assert (resolved, skipped, failed) == (0, 0, 0)
+        mock_resolve.assert_not_called()
+
+    @patch("projctl.handlers.comment._resolve_discussion")
+    def test_missing_discussion_id_is_skipped(self, mock_resolve: MagicMock) -> None:
+        """Entries without discussion_id are silently dropped; counter stays zero."""
+        resolved, skipped, failed = _resolve_discussions(1, [{}], dry_run=False)
+
+        assert (resolved, skipped, failed) == (0, 0, 0)
+        mock_resolve.assert_not_called()
+
+    @patch("projctl.handlers.comment._resolve_discussion")
+    def test_already_resolved_increments_skipped(self, mock_resolve: MagicMock) -> None:
+        """None return from _resolve_discussion increments skipped."""
+        mock_resolve.return_value = None
+        _, skipped, _ = _resolve_discussions(1, [{"discussion_id": "aaa"}], dry_run=False)
+
+        assert skipped == 1
+
+    @patch("projctl.handlers.comment._resolve_discussion")
+    def test_success_increments_resolved(self, mock_resolve: MagicMock) -> None:
+        """True return from _resolve_discussion increments resolved."""
+        mock_resolve.return_value = True
+        resolved, _, _ = _resolve_discussions(1, [{"discussion_id": "aaa"}], dry_run=False)
+
+        assert resolved == 1
+
+    @patch("projctl.handlers.comment._resolve_discussion")
+    def test_failure_increments_failed(self, mock_resolve: MagicMock) -> None:
+        """False return from _resolve_discussion increments failed."""
+        mock_resolve.return_value = False
+        _, _, failed = _resolve_discussions(1, [{"discussion_id": "aaa"}], dry_run=False)
+
+        assert failed == 1
+
+    @patch("projctl.handlers.comment._resolve_discussion")
+    def test_mixed_results_counted_correctly(self, mock_resolve: MagicMock) -> None:
+        """Multiple entries with different outcomes are counted independently."""
+        mock_resolve.side_effect = [True, None, False]
+        entries = [
+            {"discussion_id": "aaa"},
+            {"discussion_id": "bbb"},
+            {"discussion_id": "ccc"},
+        ]
+        resolved, skipped, failed = _resolve_discussions(1, entries, dry_run=False)
+
+        assert (resolved, skipped, failed) == (1, 1, 1)
+
+
+# ---------------------------------------------------------------------------
+# TestHandleResolve
+# ---------------------------------------------------------------------------
+
+
+class TestHandleResolve:
+    """Tests for _handle_resolve."""
+
+    @patch("projctl.handlers.comment._resolve_discussions")
+    def test_empty_list_returns_0(self, mock_resolve: MagicMock) -> None:
+        """Empty resolve list returns exit code 0 without calling _resolve_discussions."""
+        result = _handle_resolve(1, [], dry_run=False)
+
+        assert result == 0
+        mock_resolve.assert_not_called()
+
+    @patch("projctl.handlers.comment._resolve_discussions")
+    def test_all_success_returns_0(self, mock_resolve: MagicMock) -> None:
+        """No failures → exit code 0."""
+        mock_resolve.return_value = (2, 1, 0)
+
+        result = _handle_resolve(1, [{"discussion_id": "aaa"}], dry_run=False)
+
+        assert result == 0
+
+    @patch("projctl.handlers.comment._resolve_discussions")
+    def test_any_failure_returns_1(self, mock_resolve: MagicMock) -> None:
+        """Any failed discussion → exit code 1."""
+        mock_resolve.return_value = (0, 0, 1)
+
+        result = _handle_resolve(1, [{"discussion_id": "aaa"}], dry_run=False)
+
+        assert result == 1
+
+    @patch("builtins.print")
+    @patch("projctl.handlers.comment._resolve_discussions")
+    def test_dry_run_prints_summary(self, mock_resolve: MagicMock, mock_print: MagicMock) -> None:
+        """In dry-run mode, a [DRY RUN] summary line is printed."""
+        mock_resolve.return_value = (1, 0, 0)
+
+        _handle_resolve(42, [{"discussion_id": "aaa"}], dry_run=True)
+
+        printed = mock_print.call_args[0][0]
+        assert "[DRY RUN]" in printed
+        assert "42" in printed
+
+
+# ---------------------------------------------------------------------------
+# TestLoadReviewDataResolveField
+# ---------------------------------------------------------------------------
+
+
+class TestLoadReviewDataResolveField:
+    """Tests that _load_review_data accepts 'resolve' as a valid top-level key."""
+
+    def test_resolve_only_yaml_does_not_raise(self, tmp_path) -> None:
+        """YAML with only a resolve field is valid (no findings or replies required)."""
+        f = tmp_path / "review.yaml"
+        f.write_text("resolve:\n  - discussion_id: abc123\n")
+
+        data, _, _ = _load_review_data(str(f))
+
+        assert "resolve" in data
+
+    def test_empty_yaml_raises_value_error(self, tmp_path) -> None:
+        """YAML with none of findings/replies/resolve raises ValueError."""
+        f = tmp_path / "review.yaml"
+        f.write_text("approval: approved\n")
+
+        with pytest.raises(ValueError, match="findings.*replies.*resolve"):
+            _load_review_data(str(f))
