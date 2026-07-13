@@ -350,6 +350,10 @@ projctl update issue 231 --epic "&47"
 # Set story-point weight in hours
 projctl update issue 231 --weight 3
 
+# Manage 'blocked by' links (add or remove a blocker issue)
+projctl update issue 376 --add-blocker 385
+projctl update issue 376 --remove-blocker 252
+
 # Close / reopen (issue, MR, epic)
 projctl update issue 231 --state close
 projctl update epic 37 --state reopen
@@ -387,6 +391,8 @@ projctl update mr https://gitlab.com/group/repo/-/merge_requests/144 ...
 | `--due-date YYYY-MM-DD` | milestone only | Set due date |
 | `--epic REF` | issue only | Assign issue to epic (e.g. `&47`) |
 | `--weight N` | issue only | Story-point weight in hours |
+| `--add-blocker ISSUE` | issue only | Add "is blocked by" link to ISSUE (e.g. `252` or `#252`) |
+| `--remove-blocker ISSUE` | issue only | Remove "is blocked by" link to ISSUE |
 | `--state EVENT` | all (restricted) | State transition (see below) |
 | `--dry-run` | all | Show intent without any API calls |
 
@@ -401,7 +407,8 @@ projctl update mr https://gitlab.com/group/repo/-/merge_requests/144 ...
 **Key behaviors:**
 - `--assignee` / `--reviewer` accept GitLab usernames and are resolved to numeric IDs via `glab api users?username=<name>`.
 - `--milestone` accepts a milestone title or iid and is resolved to the numeric database ID via the milestones API.
-- `--dry-run` performs zero API calls (label reads are also skipped; intent is shown as `<add: [...], remove: [...]>`).
+- `--dry-run` performs zero API calls (label reads are also skipped; intent is shown as `<add: [...], remove: [...]>`). `--remove-blocker` is a partial exception: it must read the issue's current links to look up the internal link ID, so dry-run performs one GET.
+- `--add-blocker` / `--remove-blocker` accept a plain number, `#N`, or a full issue URL and both target an issue in the same project. Adding a link uses `link_type=is_blocked_by`. Removing a link raises an error if no link matching the target exists.
 - At least one update flag is required; otherwise an error is returned.
 - Type-specific flags are validated upfront and rejected with a clear message if used on the wrong resource type.
 

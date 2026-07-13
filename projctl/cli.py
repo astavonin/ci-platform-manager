@@ -489,7 +489,10 @@ def _cmd_update_github(args, config) -> int:
         return 1
 
 
-def cmd_update(args) -> int:
+# cmd_update is a linear dispatcher: per-flag validation, per-resource-type
+# field checks, and per-resource-type handler dispatch. Splitting it would
+# fragment the argparse contract without simplifying anything.
+def cmd_update(args) -> int:  # pylint: disable=too-many-statements
     """Handle the 'update' subcommand.
 
     Args:
@@ -537,6 +540,11 @@ def cmd_update(args) -> int:
         if resource_type != "issue" and getattr(args, "weight", None) is not None:
             logger.error("--weight is only valid for issue resources")
             return 1
+        if resource_type != "issue" and (
+            getattr(args, "add_blocker", None) or getattr(args, "remove_blocker", None)
+        ):
+            logger.error("--add-blocker and --remove-blocker are only valid for issue resources")
+            return 1
 
         # --- M3: Require at least one field to update ---
         if resource_type == "issue":
@@ -551,6 +559,8 @@ def cmd_update(args) -> int:
                     args.state,
                     args.epic,
                     getattr(args, "weight", None) is not None,
+                    getattr(args, "add_blocker", None),
+                    getattr(args, "remove_blocker", None),
                 ]
             )
         elif resource_type == "mr":
@@ -593,19 +603,40 @@ def cmd_update(args) -> int:
             return 1
 
         if resource_type == "issue":
-            updater.update_issue(
-                issue_ref=ref,
-                title=args.title,
-                description=args.description,
-                # L4: pass None directly when no labels given, not an empty list
-                labels_add=args.add_label,
-                labels_remove=args.remove_label,
-                assignee=args.assignee,
-                milestone=args.milestone,
-                state_event=args.state,
-                epic=args.epic,
-                weight=getattr(args, "weight", None),
+            add_blocker = getattr(args, "add_blocker", None)
+            remove_blocker = getattr(args, "remove_blocker", None)
+            # Only call update_issue when there are non-link fields to update.
+            non_link_update = any(
+                [
+                    args.title,
+                    args.description,
+                    args.add_label,
+                    args.remove_label,
+                    args.assignee,
+                    args.milestone,
+                    args.state,
+                    args.epic,
+                    getattr(args, "weight", None) is not None,
+                ]
             )
+            if non_link_update:
+                updater.update_issue(
+                    issue_ref=ref,
+                    title=args.title,
+                    description=args.description,
+                    # L4: pass None directly when no labels given, not an empty list
+                    labels_add=args.add_label,
+                    labels_remove=args.remove_label,
+                    assignee=args.assignee,
+                    milestone=args.milestone,
+                    state_event=args.state,
+                    epic=args.epic,
+                    weight=getattr(args, "weight", None),
+                )
+            if remove_blocker:
+                updater.remove_issue_link(ref, remove_blocker)
+            if add_blocker:
+                updater.add_issue_link(ref, add_blocker, link_type="is_blocked_by")
         elif resource_type == "mr":
             updater.update_mr(
                 mr_ref=ref,
@@ -875,6 +906,8 @@ def _add_update_subparser(subparsers: argparse._SubParsersAction) -> None:
         epilog="""
 Examples:
   update issue 231 --title "New title"
+  update issue 376 --add-blocker 385
+  update issue 376 --remove-blocker 252
   update mr 144 --state close
   update epic 37 --add-label "epic::active"
   update milestone 10 --due-date 2026-04-01
@@ -909,6 +942,18 @@ Examples:
     p.add_argument("--epic", type=str, help="Assign issue to epic (e.g. &47) — issue only")
     p.add_argument(
         "--weight", type=int, metavar="N", help="Story-point weight in hours (issue only)"
+    )
+    p.add_argument(
+        "--add-blocker",
+        type=str,
+        metavar="ISSUE",
+        help="Add 'blocked by' link to ISSUE (issue only, e.g. 252 or #252)",
+    )
+    p.add_argument(
+        "--remove-blocker",
+        type=str,
+        metavar="ISSUE",
+        help="Remove 'blocked by' link to ISSUE (issue only, e.g. 252 or #252)",
     )
     p.add_argument("--dry-run", action="store_true", help="Preview changes without executing")
 

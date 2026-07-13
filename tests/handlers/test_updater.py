@@ -1159,3 +1159,359 @@ class TestUpdateIssueFields:
         # URL-encoded project path must appear in the endpoint.
         assert "mygroup" in endpoint_str
         assert "issues/231" in endpoint_str
+
+
+# ---------------------------------------------------------------------------
+# add_issue_link / remove_issue_link (unit)
+# ---------------------------------------------------------------------------
+
+
+class TestAddIssueLink:
+    """Tests for TicketUpdater.add_issue_link."""
+
+    @patch("subprocess.run")
+    def test_add_link_plain_numbers(self, mock_run: Mock, new_config_path: Path, capsys) -> None:
+        """POSTs to the source issue's /links endpoint with the resolved project ID."""
+        # Call 1: project ID resolution. Call 2: POST to /links.
+        project_response = Mock(stdout='{"id": 555}', stderr="", returncode=0)
+        post_response = Mock(stdout="{}", stderr="", returncode=0)
+        mock_run.side_effect = [project_response, post_response]
+
+        updater = TicketUpdater(Config(new_config_path))
+        updater.add_issue_link("376", "385")
+
+        assert mock_run.call_count == 2
+        post_args = mock_run.call_args_list[1][0][0]
+        joined = " ".join(post_args)
+        assert "-X" in post_args and "POST" in post_args
+        assert "issues/376/links" in joined
+        fields = [post_args[i + 1] for i, a in enumerate(post_args) if a == "-f"]
+        assert "target_project_id=555" in fields
+        assert "target_issue_iid=385" in fields
+        assert "link_type=is_blocked_by" in fields
+        captured = capsys.readouterr()
+        assert "376" in captured.out and "385" in captured.out
+
+    @patch("subprocess.run")
+    def test_add_link_custom_link_type(self, mock_run: Mock, new_config_path: Path) -> None:
+        """A non-default link_type is passed through to the POST body."""
+        project_response = Mock(stdout='{"id": 555}', stderr="", returncode=0)
+        post_response = Mock(stdout="{}", stderr="", returncode=0)
+        mock_run.side_effect = [project_response, post_response]
+
+        updater = TicketUpdater(Config(new_config_path))
+        updater.add_issue_link("376", "385", link_type="relates_to")
+
+        post_args = mock_run.call_args_list[1][0][0]
+        fields = [post_args[i + 1] for i, a in enumerate(post_args) if a == "-f"]
+        assert "link_type=relates_to" in fields
+
+    @patch("subprocess.run")
+    def test_add_link_hash_prefix_target(self, mock_run: Mock, new_config_path: Path) -> None:
+        """#N syntax on the target strips the prefix in the POST body."""
+        project_response = Mock(stdout='{"id": 555}', stderr="", returncode=0)
+        post_response = Mock(stdout="{}", stderr="", returncode=0)
+        mock_run.side_effect = [project_response, post_response]
+
+        updater = TicketUpdater(Config(new_config_path))
+        updater.add_issue_link("376", "#385")
+
+        post_args = mock_run.call_args_list[1][0][0]
+        fields = [post_args[i + 1] for i, a in enumerate(post_args) if a == "-f"]
+        assert "target_issue_iid=385" in fields
+
+    @patch("subprocess.run")
+    def test_add_link_url_source_uses_encoded_project(
+        self, mock_run: Mock, new_config_path: Path
+    ) -> None:
+        """URL source ref produces a URL-encoded project path in the endpoint."""
+        project_response = Mock(stdout='{"id": 555}', stderr="", returncode=0)
+        post_response = Mock(stdout="{}", stderr="", returncode=0)
+        mock_run.side_effect = [project_response, post_response]
+
+        updater = TicketUpdater(Config(new_config_path))
+        url = "https://gitlab.example.com/mygroup/myproject/-/issues/376"
+        updater.add_issue_link(url, "385")
+
+        post_args = mock_run.call_args_list[1][0][0]
+        joined = " ".join(post_args)
+        # URL-encoded path 'mygroup%2Fmyproject' appears; and IID resolves to 376.
+        assert "mygroup" in joined
+        assert "issues/376/links" in joined
+
+    @patch("subprocess.run")
+    def test_add_link_dry_run_no_api_calls(
+        self, mock_run: Mock, new_config_path: Path, capsys
+    ) -> None:
+        """Dry run prints intent and makes no API calls (including no project ID lookup)."""
+        updater = TicketUpdater(Config(new_config_path), dry_run=True)
+
+        updater.add_issue_link("376", "385")
+
+        mock_run.assert_not_called()
+        captured = capsys.readouterr()
+        assert "DRY RUN" in captured.out
+        assert "issues/376/links" in captured.out
+        assert "385" in captured.out
+
+    def test_add_link_invalid_source_ref_raises(self, new_config_path: Path) -> None:
+        """Unparseable source reference surfaces a ValueError from the loader."""
+        updater = TicketUpdater(Config(new_config_path))
+
+        with pytest.raises(ValueError, match="Cannot parse issue reference"):
+            updater.add_issue_link("not-a-ref", "385")
+
+    def test_add_link_invalid_target_ref_raises(self, new_config_path: Path) -> None:
+        """Unparseable target reference surfaces a ValueError from the loader."""
+        updater = TicketUpdater(Config(new_config_path))
+
+        with pytest.raises(ValueError, match="Cannot parse issue reference"):
+            updater.add_issue_link("376", "not-a-ref")
+
+
+class TestRemoveIssueLink:
+    """Tests for TicketUpdater.remove_issue_link."""
+
+    @patch("subprocess.run")
+    def test_remove_link_matches_by_iid_and_uses_issue_link_id(
+        self, mock_run: Mock, new_config_path: Path, capsys
+    ) -> None:
+        """DELETE targets links/<issue_link_id> — NOT links/<linked-issue-id>."""
+        # Call 1: GET current links. Call 2: DELETE by link ID.
+        links_payload = (
+            '[{"id": 9999, "iid": 385, "issue_link_id": 42, "title": "Blocker"},'
+            ' {"id": 8888, "iid": 400, "issue_link_id": 43, "title": "Other"}]'
+        )
+        get_response = Mock(stdout=links_payload, stderr="", returncode=0)
+        delete_response = Mock(stdout="", stderr="", returncode=0)
+        mock_run.side_effect = [get_response, delete_response]
+
+        updater = TicketUpdater(Config(new_config_path))
+        updater.remove_issue_link("376", "385")
+
+        assert mock_run.call_count == 2
+        delete_args = mock_run.call_args_list[1][0][0]
+        joined = " ".join(delete_args)
+        assert "-X" in delete_args and "DELETE" in delete_args
+        # Uses issue_link_id (42), not the linked issue's database id (9999).
+        assert "issues/376/links/42" in joined
+        assert "issues/376/links/9999" not in joined
+        captured = capsys.readouterr()
+        assert "376" in captured.out and "385" in captured.out
+
+    @patch("subprocess.run")
+    def test_remove_link_no_matching_link_raises(
+        self, mock_run: Mock, new_config_path: Path
+    ) -> None:
+        """ValueError is raised when the target IID is not present in the links list."""
+        # Only one link, not matching target 385.
+        links_payload = '[{"id": 8888, "iid": 400, "issue_link_id": 43}]'
+        mock_run.return_value = Mock(stdout=links_payload, stderr="", returncode=0)
+
+        updater = TicketUpdater(Config(new_config_path))
+
+        with pytest.raises(ValueError, match="No link found"):
+            updater.remove_issue_link("376", "385")
+
+        # Exactly one call — the DELETE never happens.
+        assert mock_run.call_count == 1
+
+    @patch("subprocess.run")
+    def test_remove_link_empty_links_list_raises(
+        self, mock_run: Mock, new_config_path: Path
+    ) -> None:
+        """ValueError is raised when the source issue has no links at all."""
+        mock_run.return_value = Mock(stdout="[]", stderr="", returncode=0)
+
+        updater = TicketUpdater(Config(new_config_path))
+
+        with pytest.raises(ValueError, match="No link found"):
+            updater.remove_issue_link("376", "385")
+
+    @patch("subprocess.run")
+    def test_remove_link_dry_run_reads_but_does_not_delete(
+        self, mock_run: Mock, new_config_path: Path, capsys
+    ) -> None:
+        """Dry-run must fetch links to resolve the link_id, but must not issue the DELETE."""
+        links_payload = '[{"id": 9999, "iid": 385, "issue_link_id": 42}]'
+        mock_run.return_value = Mock(stdout=links_payload, stderr="", returncode=0)
+
+        updater = TicketUpdater(Config(new_config_path), dry_run=True)
+        updater.remove_issue_link("376", "385")
+
+        # Exactly one call — the GET. No DELETE followed.
+        assert mock_run.call_count == 1
+        get_args = mock_run.call_args_list[0][0][0]
+        assert "-X" not in get_args  # a bare GET, no method override
+        captured = capsys.readouterr()
+        assert "DRY RUN" in captured.out
+        assert "issues/376/links/42" in captured.out
+
+    @patch("subprocess.run")
+    def test_remove_link_url_source_uses_encoded_project(
+        self, mock_run: Mock, new_config_path: Path
+    ) -> None:
+        """URL source ref produces a URL-encoded project path in both endpoints."""
+        links_payload = '[{"id": 9999, "iid": 385, "issue_link_id": 42}]'
+        get_response = Mock(stdout=links_payload, stderr="", returncode=0)
+        delete_response = Mock(stdout="", stderr="", returncode=0)
+        mock_run.side_effect = [get_response, delete_response]
+
+        updater = TicketUpdater(Config(new_config_path))
+        url = "https://gitlab.example.com/mygroup/myproject/-/issues/376"
+        updater.remove_issue_link(url, "385")
+
+        get_args = mock_run.call_args_list[0][0][0]
+        delete_args = mock_run.call_args_list[1][0][0]
+        assert "mygroup" in " ".join(get_args)
+        assert "mygroup" in " ".join(delete_args)
+
+
+class TestResolveProjectId:  # pylint: disable=too-few-public-methods
+    """Unit test for TicketUpdater._resolve_project_id."""
+
+    @patch("subprocess.run")
+    def test_resolve_project_id_returns_stringified_id(
+        self, mock_run: Mock, new_config_path: Path
+    ) -> None:
+        """Numeric id from the projects API is returned as a string."""
+        mock_run.return_value = Mock(
+            stdout='{"id": 555, "path_with_namespace": "mygroup/myproject"}',
+            stderr="",
+            returncode=0,
+        )
+        updater = TicketUpdater(Config(new_config_path))
+
+        result = updater._resolve_project_id()
+
+        assert result == "555"
+        args = mock_run.call_args[0][0]
+        assert "projects/:fullpath" in " ".join(args)
+
+
+# ---------------------------------------------------------------------------
+# cmd_update — --add-blocker / --remove-blocker CLI validation
+# ---------------------------------------------------------------------------
+
+
+class TestCmdUpdateBlockerValidation:
+    """Tests for cmd_update --add-blocker / --remove-blocker CLI wiring."""
+
+    def _run_cli(self, args_list, side_effect=None):
+        """Invoke cli_main with the given argv, optionally mocking subprocess.run."""
+        old_argv = sys.argv
+        try:
+            sys.argv = args_list
+            if side_effect is None:
+                return cli_main()
+            with patch("subprocess.run", side_effect=side_effect):
+                return cli_main()
+        finally:
+            sys.argv = old_argv
+
+    def test_add_blocker_rejected_for_mr(self, new_config_path: Path) -> None:
+        """--add-blocker is rejected on MR resources."""
+        result = self._run_cli(
+            [
+                "projctl", "--config", str(new_config_path),
+                "update", "mr", "144", "--add-blocker", "252",
+            ]
+        )
+        assert result == 1
+
+    def test_add_blocker_rejected_for_epic(self, new_config_path: Path) -> None:
+        """--add-blocker is rejected on epic resources."""
+        result = self._run_cli(
+            [
+                "projctl", "--config", str(new_config_path),
+                "update", "epic", "37", "--add-blocker", "252",
+            ]
+        )
+        assert result == 1
+
+    def test_remove_blocker_rejected_for_milestone(self, new_config_path: Path) -> None:
+        """--remove-blocker is rejected on milestone resources."""
+        result = self._run_cli(
+            [
+                "projctl", "--config", str(new_config_path),
+                "update", "milestone", "10", "--remove-blocker", "252",
+            ]
+        )
+        assert result == 1
+
+    def test_add_blocker_alone_counts_as_update_field(self, new_config_path: Path) -> None:
+        """--add-blocker with no other flags satisfies the at-least-one-field rule."""
+        # add_issue_link makes 2 calls: project-id lookup, then POST.
+        project_response = Mock(stdout='{"id": 555}', stderr="", returncode=0)
+        post_response = Mock(stdout="{}", stderr="", returncode=0)
+
+        result = self._run_cli(
+            [
+                "projctl", "--config", str(new_config_path),
+                "update", "issue", "376", "--add-blocker", "385",
+            ],
+            side_effect=[project_response, post_response],
+        )
+        assert result == 0
+
+    def test_remove_blocker_alone_counts_as_update_field(self, new_config_path: Path) -> None:
+        """--remove-blocker with no other flags satisfies the at-least-one-field rule."""
+        # remove_issue_link makes 2 calls: GET links, then DELETE.
+        links_payload = '[{"id": 9999, "iid": 385, "issue_link_id": 42}]'
+        get_response = Mock(stdout=links_payload, stderr="", returncode=0)
+        delete_response = Mock(stdout="", stderr="", returncode=0)
+
+        result = self._run_cli(
+            [
+                "projctl", "--config", str(new_config_path),
+                "update", "issue", "376", "--remove-blocker", "385",
+            ],
+            side_effect=[get_response, delete_response],
+        )
+        assert result == 0
+
+    def test_add_blocker_with_title_triggers_both_operations(
+        self, new_config_path: Path
+    ) -> None:
+        """--add-blocker combined with --title triggers PUT (title) then POST (link)."""
+        put_response = Mock(stdout='{"iid": 376, "title": "New"}', stderr="", returncode=0)
+        project_response = Mock(stdout='{"id": 555}', stderr="", returncode=0)
+        post_response = Mock(stdout="{}", stderr="", returncode=0)
+
+        result = self._run_cli(
+            [
+                "projctl", "--config", str(new_config_path),
+                "update", "issue", "376", "--title", "New", "--add-blocker", "385",
+            ],
+            side_effect=[put_response, project_response, post_response],
+        )
+        assert result == 0
+
+    def test_add_and_remove_blocker_together(self, new_config_path: Path) -> None:
+        """Both --remove-blocker and --add-blocker in one call trigger DELETE then POST."""
+        # Order in cli.py: remove first, then add.
+        links_payload = '[{"id": 9999, "iid": 252, "issue_link_id": 42}]'
+        get_response = Mock(stdout=links_payload, stderr="", returncode=0)
+        delete_response = Mock(stdout="", stderr="", returncode=0)
+        project_response = Mock(stdout='{"id": 555}', stderr="", returncode=0)
+        post_response = Mock(stdout="{}", stderr="", returncode=0)
+
+        result = self._run_cli(
+            [
+                "projctl", "--config", str(new_config_path),
+                "update", "issue", "376",
+                "--remove-blocker", "252", "--add-blocker", "385",
+            ],
+            side_effect=[get_response, delete_response, project_response, post_response],
+        )
+        assert result == 0
+
+    def test_no_flags_still_errors(self, new_config_path: Path) -> None:
+        """update issue with no flags still errors even after adding blocker flags."""
+        result = self._run_cli(
+            [
+                "projctl", "--config", str(new_config_path),
+                "update", "issue", "376",
+            ]
+        )
+        assert result == 1

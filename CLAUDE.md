@@ -376,6 +376,10 @@ projctl update issue 231 --assignee alice
 # Set milestone (title or iid — resolved to numeric ID automatically)
 projctl update issue 231 --milestone "v2.0"
 
+# Manage 'blocked by' links (add or remove a blocker issue)
+projctl update issue 376 --add-blocker 385
+projctl update issue 376 --remove-blocker 252
+
 # Change state (issue/MR/epic)
 projctl update issue 231 --state close
 projctl update issue 231 --state reopen
@@ -414,6 +418,8 @@ projctl update mr https://gitlab.com/group/repo/-/merge_requests/144 ...  # full
 | `--milestone TITLE_OR_IID` | issue, mr | Milestone by title or iid (auto-resolved to numeric ID) |
 | `--target-branch BRANCH` | mr only | Change MR target branch |
 | `--due-date YYYY-MM-DD` | milestone only | Set due date |
+| `--add-blocker ISSUE` | issue only | Add "is blocked by" link to ISSUE (e.g. `252` or `#252`) |
+| `--remove-blocker ISSUE` | issue only | Remove "is blocked by" link to ISSUE |
 | `--state EVENT` | all (restricted) | State transition (see below) |
 | `--dry-run` | all | Preview intent without any API calls |
 

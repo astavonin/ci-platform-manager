@@ -304,6 +304,99 @@ class TicketUpdater:
         self._loader._run_glab_command(self._build_put_cmd(endpoint, {"epic_id": global_epic_id}))
         print(f"✓ Assigned issue #{iid} to epic &{epic_iid}")
 
+    def _resolve_project_id(self) -> str:
+        """Resolve the current project's numeric ID via the API.
+
+        The GitLab issue-links POST endpoint requires a numeric project ID in
+        ``target_project_id``; ``:fullpath`` expansion only works in URL paths,
+        not in ``-f`` form fields passed to ``glab api``.
+
+        Returns:
+            Numeric project ID as a string.
+
+        Raises:
+            PlatformError: If the API call fails.
+        """
+        # pylint: disable=protected-access
+        output = self._loader._run_glab_command(["api", "projects/:fullpath"])
+        return str(json.loads(output)["id"])
+
+    def add_issue_link(self, issue_ref: str, target_ref: str, link_type: str = "is_blocked_by") -> None:
+        """Add a blocking/blocked-by link between two issues.
+
+        Args:
+            issue_ref: Source issue reference (number, URL, or #number format).
+            target_ref: Target issue reference (number, URL, or #number format).
+            link_type: One of "is_blocked_by", "blocks", or "relates_to".
+
+        Raises:
+            PlatformError: If the API call fails.
+            ValueError: If either reference cannot be parsed.
+        """
+        # pylint: disable=protected-access
+        project_path, iid = self._loader._parse_issue_reference(issue_ref)
+        _, target_iid = self._loader._parse_issue_reference(target_ref)
+
+        encoded_project = urllib.parse.quote(project_path, safe="") if project_path else ":fullpath"
+        endpoint = f"projects/{encoded_project}/issues/{iid}/links"
+
+        if self.dry_run:
+            print(f"[DRY RUN] Would POST {endpoint}: {link_type} link to #{target_iid}")
+            return
+
+        # target_project_id must be a numeric ID — :fullpath is not expanded in -f fields.
+        project_id = self._resolve_project_id()
+        cmd = [
+            "api", "-X", "POST", endpoint,
+            "-f", f"target_project_id={project_id}",
+            "-f", f"target_issue_iid={target_iid}",
+            "-f", f"link_type={link_type}",
+        ]
+        self._loader._run_glab_command(cmd)
+        print(f"✓ Added {link_type} link: issue #{iid} ← #{target_iid}")
+
+    def remove_issue_link(self, issue_ref: str, target_ref: str) -> None:
+        """Remove a link between two issues.
+
+        Fetches current links, finds the one matching target_ref by IID, then
+        deletes it by link ID.
+
+        Args:
+            issue_ref: Source issue reference (number, URL, or #number format).
+            target_ref: Target issue reference (number, URL, or #number format).
+
+        Raises:
+            PlatformError: If the API call fails.
+            ValueError: If either reference cannot be parsed or no matching link exists.
+        """
+        # pylint: disable=protected-access
+        project_path, iid = self._loader._parse_issue_reference(issue_ref)
+        _, target_iid = self._loader._parse_issue_reference(target_ref)
+
+        encoded_project = urllib.parse.quote(project_path, safe="") if project_path else ":fullpath"
+        links_endpoint = f"projects/{encoded_project}/issues/{iid}/links"
+
+        output = self._loader._run_glab_command(["api", links_endpoint])
+        links = json.loads(output)
+
+        link_id: Optional[int] = None
+        for link in links:
+            if str(link.get("iid")) == target_iid:
+                # GitLab returns "issue_link_id" as the link record ID; "id" is
+                # the linked issue's database ID and is not accepted by the DELETE endpoint.
+                link_id = link.get("issue_link_id")
+                break
+
+        if link_id is None:
+            raise ValueError(f"No link found between issue #{iid} and #{target_iid}")
+
+        if self.dry_run:
+            print(f"[DRY RUN] Would DELETE {links_endpoint}/{link_id} (link to #{target_iid})")
+            return
+
+        self._loader._run_glab_command(["api", "-X", "DELETE", f"{links_endpoint}/{link_id}"])
+        print(f"✓ Removed link between issue #{iid} and #{target_iid}")
+
     def update_issue(  # pylint: disable=too-many-locals,too-many-branches,too-many-arguments
         # Weight adds one more argument and one more branch, pushing the counts
         # just above the default pylint thresholds. Extracting a helper would
