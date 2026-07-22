@@ -339,6 +339,7 @@ def make_mr_config():
         default_reviewers: Optional[List[str]] = None,
         required_fields: Optional[List[str]] = None,
         required_sections: Optional[List[str]] = None,
+        allowed_labels: Optional[List[str]] = None,
     ) -> MagicMock:
         mock = MagicMock(spec=Config)
         mock.get_default_mr_reviewers.return_value = default_reviewers or []
@@ -347,6 +348,7 @@ def make_mr_config():
             required_sections
             or ["Summary", "Implementation Details", "How It Was Tested"]
         )
+        mock.get_allowed_labels.return_value = allowed_labels
         return mock
 
     return _factory

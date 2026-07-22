@@ -6,6 +6,7 @@ from typing import List, Optional
 
 from ..config import Config
 from ..utils.gh_runner import run_gh_command
+from ..utils.validation import validate_labels
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,7 @@ class GithubUpdater:
             ValueError: If ref cannot be parsed.
         """
         number = self._parse_number(ref, prefix="#")
+        self._validate_labels_add(labels_add)
         self._apply_update(
             "issue",
             number,
@@ -100,6 +102,7 @@ class GithubUpdater:
             ValueError: If ref cannot be parsed.
         """
         number = self._parse_number(ref, prefix="!")
+        self._validate_labels_add(labels_add)
         self._apply_update(
             "pr",
             number,
@@ -115,6 +118,11 @@ class GithubUpdater:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _validate_labels_add(self, labels_add: Optional[List[str]]) -> None:
+        """Raise ValueError if any label in labels_add is not in the allowed list."""
+        if labels_add:
+            validate_labels(list(labels_add), self.config.get_allowed_labels())
 
     @staticmethod
     def _parse_number(ref: str, prefix: str) -> str:

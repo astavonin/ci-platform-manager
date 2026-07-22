@@ -77,7 +77,7 @@ gitlab:
   labels:
     default: ["type::feature", "development-status::backlog"]  # REQUIRED
     default_epic: ["type::epic"]  # OPTIONAL (only for creating epics)
-    allowed: []  # OPTIONAL (empty = no validation)
+    allowed: []  # OPTIONAL — key absent = no validation; empty list = all labels rejected
 
 # GitHub-specific settings (future)
 github:
@@ -114,7 +114,7 @@ planning_sync:
 
 **OPTIONAL:**
 - `labels.default_epic` - Only needed when *creating* epics (not for loading)
-- `labels.allowed` (or `allowed_labels` for legacy configs) - For label validation
+- `labels.allowed` (or `allowed_labels` for legacy configs) - Enforced on every path that accepts a label: `create` (issues), `update --add-label` (issue/MR/epic), and `create-mr` (MR/PR). Key absent → no validation; empty list → all labels rejected.
 - All other sections depend on features used
 
 **Legacy Config Support:**

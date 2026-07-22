@@ -62,6 +62,7 @@ gitlab:
   default_group: "my-group/my-project"
   labels:
     default: ["type::feature", "status::backlog"]
+    allowed: ["type::feature", "type::bug", "status::backlog", "status::in-progress"]
 
 common:
   mr_template:
@@ -69,6 +70,8 @@ common:
       - alice
       - bob
 ```
+
+**Label allowlist.** When `labels.allowed` is set, every command that accepts a label — `create` for issues, `update --add-label` for issues, MRs, and epics, and `create-mr` for merge requests and pull requests — rejects labels outside the list before making any API call. Omit the key to skip the check entirely; set it to `[]` to reject every label.
 
 Run `projctl config` to see which config file is active and what the fully merged, resolved configuration looks like.
 

@@ -17,6 +17,7 @@ from ..utils.gh_runner import run_gh_command
 from ..utils.validation import (
     apply_required_issue_fields,
     validate_issue_description,
+    validate_labels,
     validate_required_label_groups,
 )
 
@@ -302,6 +303,9 @@ class GithubIssueCreator:
         if not isinstance(issue_labels, list):
             issue_labels = []
         all_labels = list(dict.fromkeys(default_labels + issue_labels))
+
+        # Validate labels against the allowed list (no-op if not configured).
+        validate_labels(all_labels, self.config.get_allowed_labels())
 
         # Validate required OR groups — exactly one label per group must be present
         validate_required_label_groups(all_labels, self.config.get_required_label_groups())

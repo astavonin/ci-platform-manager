@@ -419,6 +419,57 @@ class TestOrGroupValidationBeforeSubprocess:
 
 
 # ---------------------------------------------------------------------------
+# M4: allowed-label validation fires before any subprocess call
+# ---------------------------------------------------------------------------
+
+
+class TestAllowedLabelValidationBeforeSubprocess:
+    """Ensure allowed-label validation fires before any subprocess call."""
+
+    def _config_with_allowed(self, tmp_path: Path) -> Config:
+        cfg_path = tmp_path / "config_allowed.yaml"
+        cfg_path.write_text(
+            "platform: github\n"
+            "github:\n"
+            "  repo: owner/repo\n"
+            "  labels:\n"
+            "    allowed:\n"
+            "      - type::feature\n"
+            "      - type::bug\n"
+            "common:\n"
+            "  issue_template:\n"
+            "    required_sections:\n"
+            "      - Description\n"
+            "      - Acceptance Criteria\n"
+        )
+        return Config(cfg_path)
+
+    @patch("subprocess.run")
+    def test_unknown_label_raises_before_gh(self, mock_run: Mock, tmp_path: Path) -> None:
+        """ValueError from allowlist validation fires before any gh subprocess call."""
+        config = self._config_with_allowed(tmp_path)
+        creator = GithubIssueCreator(config, dry_run=False)
+
+        yaml_path = _write_yaml(
+            tmp_path / "issues_bad_label.yaml",
+            {
+                "issues": [
+                    {
+                        "title": "Bad label",
+                        "description": _VALID_DESCRIPTION,
+                        "labels": ["Infra & DevOps"],  # not in allowed list
+                    }
+                ]
+            },
+        )
+
+        with pytest.raises(ValueError, match="Infra & DevOps"):
+            creator.process_yaml_file(yaml_path)
+
+        mock_run.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # GitHub required-field validation for issues
 # ---------------------------------------------------------------------------
 

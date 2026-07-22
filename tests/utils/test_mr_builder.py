@@ -25,8 +25,15 @@ def _args(**kwargs) -> types.SimpleNamespace:
     return types.SimpleNamespace(**defaults)
 
 
-def _config(mr_sections=None, mr_fields=None, default_reviewers=None) -> Mock:
-    """Build a mock Config that returns the given MR required sections and required fields."""
+def _config(
+    mr_sections=None, mr_fields=None, default_reviewers=None, allowed_labels=None
+) -> Mock:
+    """Build a mock Config that returns the given MR required sections and required fields.
+
+    ``allowed_labels`` defaults to ``None`` (no label validation configured),
+    matching the real ``Config.get_allowed_labels`` contract when the config
+    file omits the ``allowed`` key.
+    """
     if mr_sections is None:
         mr_sections = ["Summary", "Implementation Details", "How It Was Tested"]
     if mr_fields is None:
@@ -37,6 +44,7 @@ def _config(mr_sections=None, mr_fields=None, default_reviewers=None) -> Mock:
     mock.get_required_mr_sections.return_value = mr_sections
     mock.get_required_mr_fields.return_value = mr_fields
     mock.get_default_mr_reviewers.return_value = default_reviewers
+    mock.get_allowed_labels.return_value = allowed_labels
     return mock
 
 
@@ -275,6 +283,69 @@ class TestValidateMrArgsRequiredFields:
         config = _config(mr_fields=["reviewers", "labels"])
 
         # Act / Assert — no exception; fill early-returns before any check
+        validate_mr_args(args, config)
+
+
+class TestValidateMrArgsLabelAllowlist:
+    """validate_mr_args enforces the label allowlist from config on the --label flag."""
+
+    def test_no_allowed_labels_configured_any_label_passes(self) -> None:
+        """allowed=None (key absent) → validation is a no-op regardless of label content."""
+        # Arrange
+        args = _args(
+            title="My MR", description=_VALID_DESCRIPTION, label=["arbitrary::whatever"]
+        )
+        config = _config(allowed_labels=None)
+
+        # Act / Assert — no exception
+        validate_mr_args(args, config)
+
+    def test_label_in_allowed_list_passes(self) -> None:
+        """Label present in allowed list → no exception."""
+        # Arrange
+        args = _args(title="My MR", description=_VALID_DESCRIPTION, label=["type::feature"])
+        config = _config(allowed_labels=["type::feature", "type::bug"])
+
+        # Act / Assert — no exception
+        validate_mr_args(args, config)
+
+    def test_unknown_label_raises_value_error(self) -> None:
+        """Label not in allowed list → ValueError naming the offending label."""
+        # Arrange
+        args = _args(title="My MR", description=_VALID_DESCRIPTION, label=["Infra & DevOps"])
+        config = _config(allowed_labels=["type::feature", "type::bug"])
+
+        # Act / Assert
+        with pytest.raises(ValueError, match="Infra & DevOps"):
+            validate_mr_args(args, config)
+
+    def test_unknown_label_raises_with_fill_true(self) -> None:
+        """Even with --fill, unknown --label values are rejected (labels are always known)."""
+        # Arrange
+        args = _args(title=None, description=None, fill=True, label=["Infra & DevOps"])
+        config = _config(allowed_labels=["type::feature"])
+
+        # Act / Assert
+        with pytest.raises(ValueError, match="Infra & DevOps"):
+            validate_mr_args(args, config)
+
+    def test_empty_allowed_list_rejects_any_label(self) -> None:
+        """allowed=[] (explicitly empty) → any label is rejected."""
+        # Arrange
+        args = _args(title="My MR", description=_VALID_DESCRIPTION, label=["type::feature"])
+        config = _config(allowed_labels=[])
+
+        # Act / Assert
+        with pytest.raises(ValueError, match="type::feature"):
+            validate_mr_args(args, config)
+
+    def test_empty_allowed_list_no_labels_passes(self) -> None:
+        """allowed=[] with no --label values → no exception (nothing to reject)."""
+        # Arrange
+        args = _args(title="My MR", description=_VALID_DESCRIPTION, label=[])
+        config = _config(allowed_labels=[])
+
+        # Act / Assert — no exception
         validate_mr_args(args, config)
 
 
