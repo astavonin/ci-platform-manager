@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -283,21 +284,19 @@ class PlanningSyncHandler:
     def _get_planning_path(self) -> Path:
         """Get planning folder path (./planning/ from repo root).
 
+        Does not require the folder to exist: `pull()` bootstraps a fresh
+        checkout by creating it, so existence is enforced by the operations
+        that actually need local content (`push()`, `status()`), not here.
+
         Returns:
             Path to planning folder.
 
         Raises:
-            PlatformError: If planning folder doesn't exist.
+            PlatformError: If the path exists but is not a directory.
         """
         planning_path = self.repo_root / "planning"
 
-        if not planning_path.exists():
-            raise PlatformError(
-                f"Planning folder not found: {planning_path}\n\n"
-                f"Expected planning folder in repository root."
-            )
-
-        if not planning_path.is_dir():
+        if planning_path.exists() and not planning_path.is_dir():
             raise PlatformError(f"Planning path exists but is not a directory: {planning_path}")
 
         return planning_path
@@ -390,9 +389,15 @@ class PlanningSyncHandler:
         Syncs ./planning/ to the Google Drive backup location.
 
         Raises:
-            PlatformError: If sync fails.
+            PlatformError: If sync fails or the local planning folder doesn't exist.
         """
         self._verify_rsync_available()
+
+        if not self.planning_path.exists():
+            raise PlatformError(
+                f"Planning folder not found: {self.planning_path}\n\n"
+                f"Expected planning folder in repository root."
+            )
 
         # Verify Google Drive base exists
         if not self.gdrive_base.exists():
@@ -807,13 +812,22 @@ class PlanningSyncHandler:
                 f"Verify Google Drive is mounted and path is correct in config."
             )
 
-        if self.gdrive_repo_path.exists():
-            push_entries = self._rsync_itemize(self.planning_path, self.gdrive_repo_path)
-            pull_entries = self._rsync_itemize(self.gdrive_repo_path, self.planning_path)
-        else:
-            with tempfile.TemporaryDirectory() as tmp:
-                push_entries = self._rsync_itemize(self.planning_path, Path(tmp))
-                pull_entries = self._rsync_itemize(Path(tmp), self.planning_path)
+        with contextlib.ExitStack() as stack:
+            if self.planning_path.exists():
+                local = self.planning_path
+            else:
+                # Fresh checkout with no local planning/ yet: treat it as empty
+                # so a missing folder reads as "remote-ahead" rather than an
+                # rsync error — mirrors the missing-remote branch below.
+                local = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+
+            if self.gdrive_repo_path.exists():
+                remote = self.gdrive_repo_path
+            else:
+                remote = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+
+            push_entries = self._rsync_itemize(local, remote)
+            pull_entries = self._rsync_itemize(remote, local)
 
         classification = self._classify_drift(push_entries, pull_entries)
         print(self._format_status_report(classification))
