@@ -526,3 +526,250 @@ class TestCmdNote:
 
         _, kwargs = mock_handler_cls.call_args
         assert kwargs.get("dry_run") is True or mock_handler_cls.call_args[0][1] is True
+
+    @patch("projctl.cli.Config")
+    @patch("projctl.cli.NoteHandler")
+    def test_cmd_note_epic_dispatch(
+        self, mock_handler_cls: MagicMock, mock_config_cls: MagicMock
+    ) -> None:
+        """cmd_note dispatches to add_epic_note when resource_type is 'epic'."""
+        import argparse
+
+        from projctl.cli import cmd_note
+
+        mock_config_cls.return_value.platform = "gitlab"
+        mock_handler_cls.return_value.add_epic_note.return_value = None
+        args = argparse.Namespace(
+            resource_type="epic",
+            reference="&64",
+            body="closed",
+            dry_run=False,
+            config=None,
+        )
+
+        result = cmd_note(args)
+
+        assert result == 0
+        mock_handler_cls.return_value.add_epic_note.assert_called_once_with("&64", "closed")
+        mock_handler_cls.return_value.add_issue_note.assert_not_called()
+        mock_handler_cls.return_value.add_mr_note.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# add_epic_note
+# ---------------------------------------------------------------------------
+
+
+def _make_epic_handler(default_group: str = "my/group", dry_run: bool = False) -> NoteHandler:
+    """Create a NoteHandler with a config that returns a default_group."""
+    cfg = MagicMock()
+    cfg.get_default_group.return_value = default_group
+    return NoteHandler(config=cfg, dry_run=dry_run)
+
+
+def _graphql_query_from_call(mock_run: MagicMock) -> str:
+    """Return the GraphQL query text from the last run_glab_command call."""
+    args = mock_run.call_args[0][0]
+    for arg in args:
+        if arg.startswith("query="):
+            return arg[len("query="):]
+    return ""
+
+
+class TestAddEpicNote:
+    """Tests for NoteHandler.add_epic_note."""
+
+    @patch(_PATCH_PATH)
+    def test_add_epic_note_happy_path_amp_ref(self, mock_run: MagicMock) -> None:
+        """`&64` reference resolves work_item_id via REST, then posts via GraphQL."""
+        mock_run.side_effect = [
+            json.dumps({"iid": 64, "work_item_id": 195684}),
+            json.dumps({"data": {"createNote": {"note": {"id": "gid://gitlab/Note/1"}, "errors": []}}}),
+        ]
+        handler = _make_epic_handler()
+
+        handler.add_epic_note("&64", "hello")
+
+        # First call: REST GET epic
+        assert mock_run.call_args_list[0][0][0] == [
+            "api",
+            "groups/my%2Fgroup/epics/64",
+        ]
+        # Second call: GraphQL createNote
+        second = mock_run.call_args_list[1][0][0]
+        assert second[:3] == ["api", "graphql", "-f"]
+        assert "createNote" in second[3]
+        assert "gid://gitlab/WorkItem/195684" in second[3]
+
+    @patch(_PATCH_PATH)
+    def test_add_epic_note_plain_numeric_ref(self, mock_run: MagicMock) -> None:
+        """Plain numeric ref (no & prefix) is accepted."""
+        mock_run.side_effect = [
+            json.dumps({"iid": 64, "work_item_id": 195684}),
+            json.dumps({"data": {"createNote": {"note": {"id": "gid://gitlab/Note/1"}, "errors": []}}}),
+        ]
+        handler = _make_epic_handler()
+
+        handler.add_epic_note("64", "hello")
+
+        assert "epics/64" in mock_run.call_args_list[0][0][0][1]
+
+    @patch(_PATCH_PATH)
+    def test_add_epic_note_url_uses_url_group(self, mock_run: MagicMock) -> None:
+        """Full epic URL extracts the group path and ignores the config default."""
+        mock_run.side_effect = [
+            json.dumps({"iid": 64, "work_item_id": 195684}),
+            json.dumps({"data": {"createNote": {"note": {"id": "gid://gitlab/Note/1"}, "errors": []}}}),
+        ]
+        handler = _make_epic_handler(default_group="wrong/group")
+
+        handler.add_epic_note(
+            "https://gitlab.com/groups/right/group/-/epics/64", "hello"
+        )
+
+        first_endpoint = mock_run.call_args_list[0][0][0][1]
+        assert "groups/right%2Fgroup/epics/64" == first_endpoint
+
+    @patch(_PATCH_PATH)
+    def test_add_epic_note_body_included_in_graphql(self, mock_run: MagicMock) -> None:
+        """Body text appears verbatim in the createNote mutation."""
+        mock_run.side_effect = [
+            json.dumps({"iid": 64, "work_item_id": 195684}),
+            json.dumps({"data": {"createNote": {"note": {"id": "gid://gitlab/Note/1"}, "errors": []}}}),
+        ]
+        handler = _make_epic_handler()
+
+        handler.add_epic_note("&64", "my epic note body")
+
+        assert "my epic note body" in _graphql_query_from_call(mock_run)
+
+    @patch(_PATCH_PATH)
+    def test_add_epic_note_body_escapes_quotes_and_backslashes(self, mock_run: MagicMock) -> None:
+        """Double-quotes and backslashes in the body are escaped for GraphQL."""
+        mock_run.side_effect = [
+            json.dumps({"iid": 64, "work_item_id": 195684}),
+            json.dumps({"data": {"createNote": {"note": {"id": "gid://gitlab/Note/1"}, "errors": []}}}),
+        ]
+        handler = _make_epic_handler()
+
+        handler.add_epic_note("&64", 'has "quotes" and a \\ backslash')
+
+        query = _graphql_query_from_call(mock_run)
+        assert 'has \\"quotes\\" and a \\\\ backslash' in query
+
+    @patch(_PATCH_PATH)
+    def test_add_epic_note_body_escapes_newlines_and_tabs(self, mock_run: MagicMock) -> None:
+        """Raw LineTerminators/tabs must be escaped — GraphQL string literals forbid them."""
+        mock_run.side_effect = [
+            json.dumps({"iid": 64, "work_item_id": 195684}),
+            json.dumps({"data": {"createNote": {"note": {"id": "gid://gitlab/Note/1"}, "errors": []}}}),
+        ]
+        handler = _make_epic_handler()
+
+        handler.add_epic_note("&64", "line1\nline2\tindented\rcarriage")
+
+        query = _graphql_query_from_call(mock_run)
+        # Escaped forms must appear in the query…
+        assert "line1\\nline2\\tindented\\rcarriage" in query
+        # …and no raw control chars may appear inside the body literal.
+        body_segment = query.split("body: ", 1)[1]
+        assert "\n" not in body_segment
+        assert "\r" not in body_segment
+        assert "\t" not in body_segment
+
+    def test_add_epic_note_invalid_ref(self) -> None:
+        """Non-numeric, non-URL reference raises ValueError."""
+        handler = _make_epic_handler()
+
+        with pytest.raises(ValueError, match="garbage"):
+            handler.add_epic_note("garbage", "hello")
+
+    def test_add_epic_note_url_non_numeric_iid_raises(self) -> None:
+        """URL with non-numeric epic iid raises ValueError."""
+        handler = _make_epic_handler()
+
+        with pytest.raises(ValueError):
+            handler.add_epic_note(
+                "https://gitlab.com/groups/g/-/epics/abc", "hello"
+            )
+
+    def test_add_epic_note_empty_body(self) -> None:
+        """Empty body raises ValueError (checked before any API call)."""
+        handler = _make_epic_handler()
+
+        with pytest.raises(ValueError):
+            handler.add_epic_note("&64", "")
+
+    def test_add_epic_note_whitespace_body(self) -> None:
+        """Whitespace-only body raises ValueError."""
+        handler = _make_epic_handler()
+
+        with pytest.raises(ValueError):
+            handler.add_epic_note("&64", "   ")
+
+    def test_add_epic_note_local_ref_without_default_group_raises(self) -> None:
+        """Local &N ref with no configured default_group raises ValueError."""
+        cfg = MagicMock()
+        cfg.get_default_group.return_value = None
+        handler = NoteHandler(config=cfg, dry_run=False)
+
+        with pytest.raises(ValueError, match="Group path is required"):
+            handler.add_epic_note("&64", "hello")
+
+    @patch(_PATCH_PATH)
+    def test_add_epic_note_missing_work_item_id_raises(self, mock_run: MagicMock) -> None:
+        """Epic REST response without work_item_id raises PlatformError."""
+        mock_run.return_value = json.dumps({"iid": 64})
+        handler = _make_epic_handler()
+
+        with pytest.raises(PlatformError, match="work_item_id"):
+            handler.add_epic_note("&64", "hello")
+
+    @patch(_PATCH_PATH)
+    def test_add_epic_note_graphql_errors_raise(self, mock_run: MagicMock) -> None:
+        """GraphQL createNote errors surface as PlatformError."""
+        mock_run.side_effect = [
+            json.dumps({"iid": 64, "work_item_id": 195684}),
+            json.dumps({"data": {"createNote": {"note": None, "errors": ["denied"]}}}),
+        ]
+        handler = _make_epic_handler()
+
+        with pytest.raises(PlatformError, match="denied"):
+            handler.add_epic_note("&64", "hello")
+
+    @patch(_PATCH_PATH)
+    def test_add_epic_note_non_json_rest_response_raises(self, mock_run: MagicMock) -> None:
+        """Non-JSON REST response raises PlatformError."""
+        mock_run.return_value = "<html>error</html>"
+        handler = _make_epic_handler()
+
+        with pytest.raises(PlatformError):
+            handler.add_epic_note("&64", "hello")
+
+    @patch(_PATCH_PATH)
+    def test_add_epic_note_dry_run_skips_graphql_call(self, mock_run: MagicMock) -> None:
+        """Dry-run resolves work_item_id but does not call the GraphQL mutation."""
+        mock_run.return_value = json.dumps({"iid": 64, "work_item_id": 195684})
+        handler = _make_epic_handler(dry_run=True)
+
+        handler.add_epic_note("&64", "hello")
+
+        # REST GET runs to resolve the work_item_id; GraphQL POST does not.
+        assert mock_run.call_count == 1
+        assert mock_run.call_args_list[0][0][0][0] == "api"
+
+    @patch("builtins.print")
+    @patch(_PATCH_PATH)
+    def test_add_epic_note_dry_run_prints_graphql_command(
+        self, mock_run: MagicMock, mock_print: MagicMock
+    ) -> None:
+        """Dry-run prints the intended GraphQL command."""
+        mock_run.return_value = json.dumps({"iid": 64, "work_item_id": 195684})
+        handler = _make_epic_handler(dry_run=True)
+
+        handler.add_epic_note("&64", "hello")
+
+        printed = " ".join(str(call) for call in mock_print.call_args_list)
+        assert "dry-run" in printed
+        assert "graphql" in printed
+        assert "hello" in printed

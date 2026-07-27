@@ -466,6 +466,27 @@ projctl create-mr --dry-run
 
 Platform dispatch: uses `gh pr create` for GitHub, `glab mr create` for GitLab, based on `config.platform`.
 
+### Notes (Comments)
+
+Post a note (comment) to a GitLab issue, MR, or epic. GitLab only.
+
+```bash
+projctl note issue 340 --body "Closing as false-positive."
+projctl note mr !194 --body "LGTM"
+projctl note epic &64 --body "Superseded by new approach."
+projctl note issue #340 --body "See also #341" --dry-run
+```
+
+Reference formats accepted per resource type:
+
+- **issue**: `N`, `#N`, or full URL (`.../-/issues/N` or `.../-/work_items/N`)
+- **mr**: `N`, `!N`, or full URL (`.../-/merge_requests/N`)
+- **epic**: `N`, `&N`, or full URL (`.../groups/G/-/epics/N`)
+
+**Epic transport:** issue and MR notes use the REST `POST /projects/:id/{issues,merge_requests}/:iid/notes` endpoint. Epic notes go via the GraphQL `createNote` mutation against the epic's backing `WorkItem` GID — GitLab 15.9+ has migrated group epics to work items, and the REST group-epic notes endpoint returns 404. The handler resolves the `work_item_id` via a REST GET on the epic first, then posts via GraphQL.
+
+**Handler:** `handlers/note.py` — `NoteHandler` class
+
 ### Pipeline Debugging
 
 Debug failed CI/CD pipeline jobs. GitLab only.

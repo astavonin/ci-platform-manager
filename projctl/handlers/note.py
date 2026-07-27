@@ -1,4 +1,4 @@
-"""Note (comment) handler for posting notes to GitLab issues and MRs."""
+"""Note (comment) handler for posting notes to GitLab issues, MRs, and epics."""
 
 import json
 import logging
@@ -8,23 +8,24 @@ from typing import List, Optional, Tuple
 
 from ..config import Config
 from ..exceptions import PlatformError
-from ..utils.git_helpers import parse_issue_url
+from ..utils.git_helpers import parse_epic_url, parse_issue_url
 from ..utils.glab_runner import run_glab_command
 
 logger = logging.getLogger(__name__)
 
 
 class NoteHandler:
-    """Posts notes to GitLab issues or MRs via the glab CLI."""
+    """Posts notes to GitLab issues, MRs, or epics via the glab CLI."""
 
-    def __init__(self, config: Config, dry_run: bool = False) -> None:  # pylint: disable=unused-argument
+    def __init__(self, config: Config, dry_run: bool = False) -> None:
         """Initialize the handler.
 
         Args:
-            config: Accepted for handler-protocol uniformity; platform dispatch
-                is handled by the CLI before this handler is constructed.
+            config: Used to resolve the default group for epic references
+                lacking an explicit group path.
             dry_run: When True, print the command instead of executing it.
         """
+        self.config = config
         self.dry_run = dry_run
 
     def _normalize_issue_ref(self, ref: str) -> Tuple[Optional[str], str]:
@@ -141,3 +142,123 @@ class NoteHandler:
         self._post_note(endpoint, body)
         if not self.dry_run:
             print(f"✓ Note added to MR !{iid}")
+
+    def _normalize_epic_ref(self, ref: str) -> Tuple[Optional[str], str]:
+        """Parse an epic reference into (group_path, iid).
+
+        Args:
+            ref: Epic reference (&N, N, or a full URL).
+
+        Returns:
+            Tuple of (group path or None, numeric iid string).
+            group path is None for local refs (&N, plain N).
+
+        Raises:
+            ValueError: If the reference cannot be parsed to a numeric iid,
+                or a URL reference lacks a group path.
+        """
+        group_path, iid = parse_epic_url(ref)
+        if not iid or not iid.isdigit():
+            raise ValueError(f"Cannot parse epic reference: {ref!r}")
+        if "/-/epics/" in ref and not group_path:
+            raise ValueError(f"Invalid epic URL format (missing group path): {ref!r}")
+        return group_path, iid
+
+    def _resolve_epic_work_item_id(self, group_path: str, iid: str) -> int:
+        """Fetch the work_item_id backing a group epic.
+
+        Args:
+            group_path: Un-encoded group path (e.g. 'my/group').
+            iid: Epic iid as string.
+
+        Returns:
+            Numeric work_item_id from the epic REST response.
+
+        Raises:
+            PlatformError: If the API call fails, response is non-JSON, or
+                the epic lacks a work_item_id field.
+        """
+        encoded_group = urllib.parse.quote(group_path, safe="")
+        endpoint = f"groups/{encoded_group}/epics/{iid}"
+        result = run_glab_command(["api", endpoint])
+        try:
+            data = json.loads(result)
+        except json.JSONDecodeError as exc:
+            raise PlatformError(f"Unexpected glab response: {result[:200]!r}") from exc
+        work_item_id = data.get("work_item_id")
+        if not work_item_id:
+            raise PlatformError(
+                f"Epic &{iid} has no work_item_id; group-epic notes require GitLab 15.9+ "
+                "with epics migrated to work items"
+            )
+        return int(work_item_id)
+
+    def _post_epic_note_graphql(self, work_item_id: int, body: str) -> None:
+        """Post a note to an epic via the GraphQL createNote mutation.
+
+        GitLab's REST group-epic notes endpoint returns 404 on instances where
+        epics have been unified under work items (15.9+); createNote against a
+        WorkItem GID is the reliable path.
+
+        Args:
+            work_item_id: Numeric work_item_id backing the epic.
+            body: Note body text (already validated non-empty).
+
+        Raises:
+            PlatformError: If the API call fails, response is non-JSON, or
+                the mutation reports errors.
+        """
+        wi_gid = f"gid://gitlab/WorkItem/{work_item_id}"
+        # GraphQL string literals forbid raw LineTerminators and other control
+        # chars; json.dumps produces the required escapes (its output is a
+        # strict superset of GraphQL's string-literal grammar).
+        body_literal = json.dumps(body)
+        query = (
+            'mutation { createNote(input: { '
+            f'noteableId: "{wi_gid}", body: {body_literal} '
+            '}) { note { id } errors } }'
+        )
+        cmd = ["api", "graphql", "-f", f"query={query}"]
+
+        if self.dry_run:
+            print(f"[dry-run] {shlex.join(['glab', *cmd])}")
+            return
+
+        result = run_glab_command(cmd)
+        try:
+            resp = json.loads(result)
+        except json.JSONDecodeError as exc:
+            raise PlatformError(f"Unexpected glab response: {result[:200]!r}") from exc
+        payload = resp.get("data", {}).get("createNote", {}) or {}
+        errors = payload.get("errors") or []
+        if errors:
+            raise PlatformError(f"GraphQL createNote failed: {errors}")
+        note = payload.get("note") or {}
+        logger.debug("Epic note created: id=%s", note.get("id", "?"))
+
+    def add_epic_note(self, epic_ref: str, body: str) -> None:
+        """Post a note to a GitLab group epic.
+
+        Args:
+            epic_ref: Epic reference (&N, N, or URL).
+            body: Note body text.
+
+        Raises:
+            ValueError: If the reference cannot be parsed, body is empty, or
+                no default group is configured for a local (&N/plain) ref.
+            PlatformError: If the API call fails.
+        """
+        if not body.strip():
+            raise ValueError("Note body cannot be empty")
+        group_path, iid = self._normalize_epic_ref(epic_ref)
+        if not group_path:
+            group_path = self.config.get_default_group()
+            if not group_path:
+                raise ValueError(
+                    "Group path is required to post a note to an epic.\n"
+                    "Either include the group in the epic URL or set 'default_group' in your config."
+                )
+        work_item_id = self._resolve_epic_work_item_id(group_path, iid)
+        self._post_epic_note_graphql(work_item_id, body)
+        if not self.dry_run:
+            print(f"✓ Note added to epic &{iid}")

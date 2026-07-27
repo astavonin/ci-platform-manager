@@ -1055,24 +1055,25 @@ def _add_note_subparser(subparsers: argparse._SubParsersAction) -> None:
     """Register the 'note' subcommand."""
     p = subparsers.add_parser(
         "note",
-        help="Post a note (comment) to a GitLab issue or MR",
+        help="Post a note (comment) to a GitLab issue, MR, or epic",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   note issue 340 --body "Closing as false-positive; passes after clean rebuild."
   note mr !194 --body "LGTM"
+  note epic &64 --body "Superseded by new approach."
   note issue #340 --body "See also #341" --dry-run
         """,
     )
     p.add_argument(
         "resource_type",
-        choices=["issue", "mr"],
+        choices=["issue", "mr", "epic"],
         help="Type of resource to comment on",
     )
     p.add_argument(
         "reference",
         type=str,
-        help="Resource reference (number, #number/!number, or URL)",
+        help="Resource reference (number, #number/!number/&number, or URL)",
     )
     p.add_argument("--body", type=str, required=True, help="Note body text")
     p.add_argument("--dry-run", action="store_true", help="Preview without posting")
@@ -1099,8 +1100,10 @@ def cmd_note(args) -> int:
 
         if args.resource_type == "issue":
             handler.add_issue_note(args.reference, args.body)
-        else:
+        elif args.resource_type == "mr":
             handler.add_mr_note(args.reference, args.body)
+        else:
+            handler.add_epic_note(args.reference, args.body)
 
         return 0
     except FileNotFoundError as err:
@@ -1260,6 +1263,7 @@ Examples:
   %(prog)s sync status
   %(prog)s update issue 231 --title "New title"
   %(prog)s note issue 340 --body "Closing as false-positive."
+  %(prog)s note epic &70 --body "Closed: different approach."
   %(prog)s pipeline-debug
   %(prog)s config
 

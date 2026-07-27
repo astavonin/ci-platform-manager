@@ -15,7 +15,7 @@ from ..formatters import (
     print_mr,
     print_mr_comments,
 )
-from ..utils.git_helpers import extract_path_from_url, parse_issue_url
+from ..utils.git_helpers import extract_path_from_url, parse_epic_url, parse_issue_url
 from ..utils.glab_runner import run_glab_command
 
 logger = logging.getLogger(__name__)
@@ -63,34 +63,10 @@ class TicketLoader:
         Raises:
             ValueError: If epic reference cannot be parsed.
         """
-        # URL format: https://gitlab.../groups/mygroup/-/epics/21
-        if "/-/epics/" in epic_ref:
-            parts = epic_ref.split("/-/epics/")
-            if len(parts) == 2:
-                group_url = parts[0]
-                iid = parts[1].split("/")[0].split("?")[0]
-
-                # Extract group path from URL
-                # Format: https://gitlab.example.com/groups/mygroup
-                if "/groups/" in group_url:
-                    group_path = group_url.split("/groups/")[-1]
-                elif "//" in group_url:
-                    # Fallback: take everything after the domain
-                    group_path = "/".join(group_url.split("//")[1].split("/")[1:])
-                else:
-                    group_path = group_url
-
-                return (group_path, iid)
-
-        # &21 format (GitLab epic reference)
-        if epic_ref.startswith("&"):
-            return (None, epic_ref[1:])
-
-        # Plain number
-        if epic_ref.isdigit():
-            return (None, epic_ref)
-
-        raise ValueError(f"Cannot parse epic reference: {epic_ref}")
+        group_path, iid = parse_epic_url(epic_ref)
+        if iid is None:
+            raise ValueError(f"Cannot parse epic reference: {epic_ref}")
+        return (group_path, iid)
 
     def _parse_milestone_reference(self, milestone_ref: str) -> tuple:
         """Parse milestone reference to extract project/group path, iid, and milestone type.

@@ -66,6 +66,41 @@ def parse_issue_url(issue_ref: str) -> Tuple[Optional[str], Optional[str]]:
     return (None, None)
 
 
+def parse_epic_url(epic_ref: str) -> Tuple[Optional[str], Optional[str]]:
+    """Parse a GitLab epic URL or reference to extract group path and iid.
+
+    Supports three formats:
+    - Full URL:  https://gitlab.../groups/mygroup/-/epics/21
+    - Prefixed:  &21
+    - Plain:     21
+
+    Args:
+        epic_ref: Epic reference string.
+
+    Returns:
+        Tuple of (group_path, iid). group_path is None when not in a URL.
+        Both values are None when the reference format is not recognised.
+    """
+    if "/-/epics/" in epic_ref:
+        parts = epic_ref.split("/-/epics/")
+        if len(parts) == 2:
+            group_url = parts[0]
+            iid = parts[1].split("/")[0].split("?")[0].split("#")[0]
+            if "/groups/" in group_url:
+                group_path = group_url.split("/groups/")[-1]
+            else:
+                group_path = extract_path_from_url(group_url)
+            return (group_path, iid)
+
+    if epic_ref.startswith("&"):
+        return (None, epic_ref[1:])
+
+    if epic_ref.isdigit():
+        return (None, epic_ref)
+
+    return (None, None)
+
+
 def get_gitlab_base_url() -> str:
     """Derive the GitLab base URL from the git remote origin.
 
