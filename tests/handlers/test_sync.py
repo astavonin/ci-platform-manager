@@ -2070,3 +2070,37 @@ class TestMemorySync:
         first_line = buf.getvalue().splitlines()[0]
         assert first_line.startswith("STATUS: ")
         assert "Memory" not in first_line
+
+
+class TestRsyncInplace:
+    """rsync must write in place so Insync records a revision, not a new Drive object.
+
+    Observed failure: `progress (2).md`-style duplicates accumulated across four projects
+    over four months. Default rsync writes a temp file then renames it over the target, so
+    the Google Drive client (Insync) sees the old inode vanish and a new one appear, and
+    uploads a *new* Drive object. Drive permits two objects with the same name in one
+    folder; materializing that folder back onto a POSIX filesystem forces the client to
+    disambiguate the second as `name (2).ext`. Only frequently-rewritten files were hit —
+    progress.md, status.md, mr-draft.yaml — which is the tell.
+    """
+
+    def test_run_rsync_uses_inplace(self, sync_env) -> None:
+        """--inplace preserves the destination inode, so the sync client sees a revision."""
+        handler, planning, gdrive_repo = sync_env
+        (planning / "progress.md").write_text("x", encoding="utf-8")
+        gdrive_repo.mkdir(parents=True, exist_ok=True)
+
+        captured: list[list[str]] = []
+
+        def fake_run(cmd, **_kwargs):
+            captured.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with patch("projctl.handlers.sync.subprocess.run", side_effect=fake_run):
+            handler._run_rsync(planning, gdrive_repo, "test", delete=True)
+
+        assert captured, "rsync was never invoked"
+        assert "--inplace" in captured[0], (
+            "rsync must pass --inplace; without it the temp-file+rename makes the Drive "
+            "client create a duplicate object instead of a new revision"
+        )

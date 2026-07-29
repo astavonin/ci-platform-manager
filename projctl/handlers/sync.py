@@ -348,8 +348,21 @@ class PlanningSyncHandler:
         source_str = f"{source}/"
         target_str = f"{target}/"
 
-        # Build rsync command using the provided exclude set for oracle parity
-        rsync_cmd = ["rsync", "-av"]
+        # Build rsync command using the provided exclude set for oracle parity.
+        #
+        # --inplace is load-bearing for Google Drive sync clients. Without it rsync writes a
+        # temp file and renames it over the target, so the client (Insync) sees the old inode
+        # vanish and a new one appear, and uploads a *new* Drive object rather than a revision
+        # of the existing one. Drive allows two objects with the same name in one folder — name
+        # is not a unique key there, the file ID is — and materializing that folder back onto a
+        # POSIX filesystem forces the client to disambiguate the second as "name (2).ext".
+        # Writing in place preserves the inode, so the client records a revision instead.
+        #
+        # Trade-off: --inplace is not atomic. A crash mid-write leaves a partially written file
+        # rather than the previous version intact. Acceptable here — planning files are
+        # Markdown/YAML recoverable from git or the other side of the sync — but do not copy
+        # this flag to a path where a torn file would be dangerous.
+        rsync_cmd = ["rsync", "-av", "--inplace"]
         if delete:
             rsync_cmd.append("--delete")
         for pat in excludes:

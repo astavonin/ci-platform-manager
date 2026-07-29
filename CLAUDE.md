@@ -536,6 +536,7 @@ ${GDRIVE_BASE}/backup/claude-memory/
 
 **Sync Strategy:**
 - Uses `rsync` with `--delete` flag (last write wins)
+- Uses `--inplace` so the Google Drive client records a revision instead of creating a duplicate object (`name (2).ext`)
 - Excludes: `*.swp`, `*~`, `.DS_Store`, `.workflow-safety.log`, `memory`
 - Efficient incremental sync (only changed files)
 - No version history (Google Drive provides 30-day file versioning)
@@ -650,7 +651,7 @@ gdrive_repo_path = gdrive_base / 'backup' / 'planning' / repo_name
 
 **Rsync command:**
 ```bash
-rsync -av --delete \
+rsync -av --inplace --delete \
   --exclude='*.swp' \
   --exclude='*~' \
   --exclude='.DS_Store' \
@@ -660,6 +661,8 @@ rsync -av --delete \
 ```
 
 **Memory pull does not use `--delete`** — local-only memory files are preserved to prevent accidental data loss (memory has no git backup).
+
+**`--inplace` is load-bearing.** Without it rsync writes a temp file and renames it over the target. The Google Drive client sees the old inode vanish and a new one appear, so it uploads a *new* Drive object rather than a revision of the existing one — and because Drive keys files by ID rather than name, two same-named objects can coexist in one folder and the client disambiguates the second as `name (2).ext` when materializing the folder back onto a POSIX filesystem. Writing in place preserves the inode. Trade-off: `--inplace` is not atomic, so a crash mid-write leaves a partially written file instead of the previous version intact — acceptable for Markdown/YAML planning files recoverable from git or the other side of the sync.
 
 ## Development
 
