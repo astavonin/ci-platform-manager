@@ -413,6 +413,7 @@ class TicketUpdater:
         state_event: Optional[str] = None,
         epic: Optional[str] = None,
         weight: Optional[int] = None,
+        due_date: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Update an existing GitLab issue.
 
@@ -427,6 +428,7 @@ class TicketUpdater:
             state_event: 'close' or 'reopen', or None to leave unchanged.
             epic: Epic reference to assign the issue to (e.g. &47), or None to skip.
             weight: Story-point weight (non-negative integer), or None to leave unchanged.
+            due_date: Due date in YYYY-MM-DD format, or None to leave unchanged.
 
         Returns:
             Updated issue data returned by the API.
@@ -456,6 +458,8 @@ class TicketUpdater:
         }
         if weight is not None:
             fields["weight"] = weight
+        if due_date is not None:
+            fields["due_date"] = due_date
 
         # Determine whether there are fields to PUT (epic assignment is a
         # separate POST and does not go through the PUT endpoint).
@@ -469,6 +473,7 @@ class TicketUpdater:
                 assignee,
                 milestone,
                 weight,
+                due_date,
             ]
         )
 

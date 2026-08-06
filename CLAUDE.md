@@ -417,7 +417,7 @@ projctl update mr https://gitlab.com/group/repo/-/merge_requests/144 ...  # full
 | `--reviewer USERNAME` | mr only | Reviewer username (auto-resolved to numeric ID) |
 | `--milestone TITLE_OR_IID` | issue, mr | Milestone by title or iid (auto-resolved to numeric ID) |
 | `--target-branch BRANCH` | mr only | Change MR target branch |
-| `--due-date YYYY-MM-DD` | milestone only | Set due date |
+| `--due-date YYYY-MM-DD` | issue, milestone | Set due date |
 | `--add-blocker ISSUE` | issue only | Add "is blocked by" link to ISSUE (e.g. `252` or `#252`) |
 | `--remove-blocker ISSUE` | issue only | Remove "is blocked by" link to ISSUE |
 | `--state EVENT` | all (restricted) | State transition (see below) |

@@ -361,7 +361,8 @@ projctl update epic 37 --state reopen
 # Update MR: reviewer, target branch
 projctl update mr 144 --reviewer bob --target-branch main
 
-# Activate milestone and set due date
+# Set a due date (issue or milestone)
+projctl update issue 231 --due-date 2026-04-01
 projctl update milestone 10 --due-date 2026-04-01 --state activate
 
 # Preview without executing — no API calls at all
@@ -388,7 +389,7 @@ projctl update mr https://gitlab.com/group/repo/-/merge_requests/144 ...
 | `--reviewer USERNAME` | mr only | Username; auto-resolved to numeric user ID |
 | `--milestone TITLE_OR_IID` | issue, mr, epic | Title or iid; auto-resolved to numeric milestone ID |
 | `--target-branch BRANCH` | mr only | Change MR target branch |
-| `--due-date YYYY-MM-DD` | milestone only | Set due date |
+| `--due-date YYYY-MM-DD` | issue, milestone | Set due date |
 | `--epic REF` | issue only | Assign issue to epic (e.g. `&47`) |
 | `--weight N` | issue only | Story-point weight in hours |
 | `--add-blocker ISSUE` | issue only | Add "is blocked by" link to ISSUE (e.g. `252` or `#252`) |

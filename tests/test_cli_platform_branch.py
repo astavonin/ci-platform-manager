@@ -179,3 +179,49 @@ class TestCmdCreateMrDispatch:
         call_args = mock_pr.call_args[0]
         assert call_args[0] is args
         assert result == 0
+
+
+class TestUpdateIssueDueDate:
+    """cmd_update reaches the updater for a due-date-only issue change.
+
+    Regression: `--due-date` on an issue passed the `has_update` check but was
+    absent from the `non_link_update` list, so cmd_update returned 0 without
+    calling update_issue at all — a silent success that left the issue
+    unchanged. Asserting the call happens is the only thing that catches it;
+    the exit code is 0 either way.
+    """
+
+    @patch("projctl.cli.TicketUpdater")
+    @patch("projctl.cli.Config")
+    def test_due_date_only_calls_updater(self, mock_config: Mock, mock_updater_cls: Mock) -> None:
+        from projctl.cli import cmd_update
+
+        mock_config.return_value = MagicMock(platform="gitlab")
+        updater = mock_updater_cls.return_value
+
+        args = SimpleNamespace(
+            update_type="issue",
+            reference="478",
+            title=None,
+            description=None,
+            add_label=None,
+            remove_label=None,
+            assignee=None,
+            reviewer=None,
+            milestone=None,
+            target_branch=None,
+            state=None,
+            epic=None,
+            due_date="2026-08-11",
+            weight=None,
+            add_blocker=None,
+            remove_blocker=None,
+            dry_run=False,
+            config=None,
+        )
+
+        rc = cmd_update(args)
+
+        assert rc == 0
+        updater.update_issue.assert_called_once()
+        assert updater.update_issue.call_args.kwargs["due_date"] == "2026-08-11"

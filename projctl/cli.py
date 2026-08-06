@@ -525,8 +525,8 @@ def cmd_update(args) -> int:  # pylint: disable=too-many-statements
         if resource_type != "mr" and (args.reviewer or args.target_branch):
             logger.error("--reviewer and --target-branch are only valid for MR resources")
             return 1
-        if resource_type != "milestone" and args.due_date:
-            logger.error("--due-date is only valid for milestone resources")
+        if resource_type not in ("milestone", "issue") and args.due_date:
+            logger.error("--due-date is only valid for issue and milestone resources")
             return 1
         if resource_type in ("epic", "milestone") and args.assignee:
             logger.error("--assignee is not valid for %s resources", resource_type)
@@ -558,6 +558,7 @@ def cmd_update(args) -> int:  # pylint: disable=too-many-statements
                     args.milestone,
                     args.state,
                     args.epic,
+                    args.due_date,
                     getattr(args, "weight", None) is not None,
                     getattr(args, "add_blocker", None),
                     getattr(args, "remove_blocker", None),
@@ -616,6 +617,7 @@ def cmd_update(args) -> int:  # pylint: disable=too-many-statements
                     args.milestone,
                     args.state,
                     args.epic,
+                    args.due_date,
                     getattr(args, "weight", None) is not None,
                 ]
             )
@@ -632,6 +634,7 @@ def cmd_update(args) -> int:  # pylint: disable=too-many-statements
                     state_event=args.state,
                     epic=args.epic,
                     weight=getattr(args, "weight", None),
+                    due_date=args.due_date,
                 )
             if remove_blocker:
                 updater.remove_issue_link(ref, remove_blocker)
@@ -933,7 +936,9 @@ Examples:
     p.add_argument("--reviewer", type=str, help="Reviewer username (MR only)")
     p.add_argument("--milestone", type=str, help="Milestone title or iid (issue, MR, and epic)")
     p.add_argument("--target-branch", type=str, help="Target branch (MR only)")
-    p.add_argument("--due-date", type=str, metavar="YYYY-MM-DD", help="Due date (milestone only)")
+    p.add_argument(
+        "--due-date", type=str, metavar="YYYY-MM-DD", help="Due date (issue and milestone only)"
+    )
     p.add_argument(
         "--state",
         choices=["close", "reopen", "activate"],

@@ -101,6 +101,39 @@ class TestUpdateIssue:
         assert any("state_event=close" in f for f in fields)
 
     @patch("subprocess.run")
+    def test_update_issue_due_date(self, mock_run: Mock, new_config_path: Path) -> None:
+        """update_issue sends due_date, which GitLab supports on issues as well as milestones."""
+        mock_run.return_value = Mock(
+            stdout='{"iid": 478, "due_date": "2026-08-11"}', stderr="", returncode=0
+        )
+        config = Config(new_config_path)
+        updater = TicketUpdater(config)
+
+        updater.update_issue("478", due_date="2026-08-11")
+
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        fields = [args[i + 1] for i, a in enumerate(args) if a == "-f"]
+        assert any("due_date=2026-08-11" in f for f in fields)
+
+    @patch("subprocess.run")
+    def test_update_issue_due_date_alone_triggers_put(
+        self, mock_run: Mock, new_config_path: Path
+    ) -> None:
+        """A due date with no other field still counts as an update.
+
+        due_date must appear in has_put_fields; omitting it there makes a
+        due-date-only call silently no-op instead of issuing the PUT.
+        """
+        mock_run.return_value = Mock(stdout='{"iid": 478}', stderr="", returncode=0)
+        config = Config(new_config_path)
+        updater = TicketUpdater(config)
+
+        updater.update_issue("478", due_date="2026-08-11")
+
+        mock_run.assert_called_once()
+
+    @patch("subprocess.run")
     def test_update_issue_label_merge(self, mock_run: Mock, new_config_path: Path) -> None:
         """update_issue fetches current labels and merges add/remove correctly."""
         # First call: GET current labels; second call: PUT update
