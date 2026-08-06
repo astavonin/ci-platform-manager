@@ -19,6 +19,7 @@ except ImportError:
 
 from .config import Config, config_search_paths
 from .exceptions import PlatformError
+from .handlers.artifacts_handler import ArtifactsHandler
 from .handlers.comment import cmd_comment
 from .handlers.labels import LabelsHandler
 from .handlers.note import NoteHandler
@@ -1150,6 +1151,64 @@ def cmd_labels(args) -> int:
         return 1
 
 
+def cmd_artifacts(args) -> int:
+    """Handle the 'artifacts' subcommand — download GitLab CI job artifacts.
+
+    With --path, fetches that single file out of the job's archive. Without it,
+    downloads the whole archive and extracts it, since a caller who does not
+    know the archive's layout cannot name a path inside it.
+
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        Exit code (0 for success, 1 for error).
+    """
+    try:
+        config_path = Path(args.config) if args.config else None
+        config = Config(config_path)
+        handler = ArtifactsHandler(config)
+        dest_dir = Path(args.dest) if args.dest else Path.cwd()
+
+        if args.path:
+            payload = handler.fetch_artifact_file(args.job_id, args.path)
+            # Mirror the archive's own layout under dest_dir rather than
+            # flattening to a basename: two artifacts can share a basename
+            # across directories, and flattening would silently overwrite.
+            out_file = dest_dir / args.path
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            out_file.write_bytes(payload)
+            print(f"✓ Wrote {len(payload)} bytes to {out_file}")
+            return 0
+
+        archive = handler.download_archive(args.job_id, dest_dir)
+        members = ArtifactsHandler.extract_archive(archive, dest_dir)
+        print(f"✓ Extracted {len(members)} file(s) from job #{args.job_id} into {dest_dir}")
+        return 0
+    except FileNotFoundError as err:
+        logger.error(str(err))
+        return 1
+    except (PlatformError, ValueError, OSError) as err:
+        logger.error("Error: %s", err)
+        return 1
+
+
+def _add_artifacts_subparser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the 'artifacts' subcommand."""
+    p = subparsers.add_parser(
+        "artifacts",
+        help="Download GitLab CI job artifacts",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--job-id", type=int, required=True, help="GitLab CI job ID")
+    p.add_argument(
+        "--path",
+        type=str,
+        help="Path of a single file inside the archive; omit to download and extract everything",
+    )
+    p.add_argument("--dest", type=str, help="Directory to write into (default: current directory)")
+
+
 def _add_pipeline_debug_subparser(subparsers: argparse._SubParsersAction) -> None:
     """Register the 'pipeline-debug' subcommand."""
     p = subparsers.add_parser(
@@ -1270,6 +1329,7 @@ Examples:
   %(prog)s note issue 340 --body "Closing as false-positive."
   %(prog)s note epic &70 --body "Closed: different approach."
   %(prog)s pipeline-debug
+  %(prog)s artifacts --job-id 12345 --path .build-12345/server.stdout
   %(prog)s config
 
 Documentation:
@@ -1293,6 +1353,7 @@ Documentation:
     _add_sync_subparser(subparsers)
     _add_update_subparser(subparsers)
     _add_pipeline_debug_subparser(subparsers)
+    _add_artifacts_subparser(subparsers)
     _add_wiki_subparser(subparsers)
     _add_note_subparser(subparsers)
     _add_labels_subparser(subparsers)
@@ -1320,6 +1381,7 @@ Documentation:
         "sync": cmd_sync,
         "update": cmd_update,
         "pipeline-debug": cmd_pipeline_debug,
+        "artifacts": cmd_artifacts,
         "wiki": cmd_wiki,
         "note": cmd_note,
         "labels": cmd_labels,

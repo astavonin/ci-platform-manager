@@ -1,12 +1,17 @@
 """Tests for projctl.utils.cli_runner module."""
 
 import subprocess
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
 
 from projctl.exceptions import PlatformError
-from projctl.utils.cli_runner import run_cli_command
+from projctl.utils.cli_runner import (
+    run_cli_command,
+    run_cli_command_binary,
+    stream_cli_command_to_file,
+)
 
 
 class TestRunCliCommandSuccess:
@@ -59,3 +64,89 @@ class TestRunCliCommandFileNotFound:
 
         with pytest.raises(PlatformError, match="gh is not installed"):
             run_cli_command("gh", ["pr", "list"], not_found_msg)
+
+
+class TestRunCliCommandBinary:
+    """run_cli_command_binary returns raw stdout bytes without text decoding."""
+
+    @patch("subprocess.run")
+    def test_returns_raw_bytes_unmodified(self, mock_run: Mock) -> None:
+        """Non-UTF-8 bytes come back byte-for-byte (would raise/corrupt under text=True)."""
+        payload = bytes(range(256))
+        mock_run.return_value = Mock(stdout=payload, stderr=b"", returncode=0)
+
+        result = run_cli_command_binary("glab", ["api", "endpoint"], "glab not found")
+
+        assert result == payload
+
+    @patch("subprocess.run")
+    def test_raises_platform_error_on_failure(self, mock_run: Mock) -> None:
+        """CalledProcessError raises PlatformError with decoded stderr."""
+        mock_run.side_effect = subprocess.CalledProcessError(
+            1, ["glab", "api", "x"], stderr=b"404 Not Found"
+        )
+
+        with pytest.raises(PlatformError, match="404 Not Found"):
+            run_cli_command_binary("glab", ["api", "x"], "glab not found")
+
+    @patch("subprocess.run")
+    def test_raises_platform_error_when_binary_missing(self, mock_run: Mock) -> None:
+        """Missing binary raises PlatformError with the provided not_found_msg."""
+        mock_run.side_effect = FileNotFoundError("No such file or directory: 'glab'")
+
+        with pytest.raises(PlatformError, match="glab not found"):
+            run_cli_command_binary("glab", ["api", "x"], "glab not found")
+
+
+class TestStreamCliCommandToFile:
+    """stream_cli_command_to_file writes raw stdout bytes directly to a file."""
+
+    @patch("subprocess.run")
+    def test_binary_content_survives_round_trip(self, mock_run: Mock, tmp_path: Path) -> None:
+        """A zip-like byte payload reaches the destination file unmodified.
+
+        Regression guard: if this path were ever rerouted through the
+        text=True runner, decoding this payload as UTF-8 would raise (or, with
+        errors ignored, silently corrupt it) — so this assertion fails the
+        moment someone makes that change.
+        """
+        payload = b"PK\x03\x04" + bytes(range(256))
+
+        def fake_subprocess_run(cmd, stdout=None, stderr=None, check=None):
+            stdout.write(payload)
+            return Mock(returncode=0)
+
+        mock_run.side_effect = fake_subprocess_run
+        dest = tmp_path / "artifacts.zip"
+
+        stream_cli_command_to_file("glab", ["api", "endpoint"], dest, "glab not found")
+
+        assert dest.read_bytes() == payload
+
+    @patch("subprocess.run")
+    def test_raises_platform_error_and_removes_partial_file(
+        self, mock_run: Mock, tmp_path: Path
+    ) -> None:
+        """A failed download reports PlatformError and cleans up the partial file."""
+        mock_run.side_effect = subprocess.CalledProcessError(
+            1, ["glab", "api", "x"], stderr=b"404 Not Found"
+        )
+        dest = tmp_path / "artifacts.zip"
+
+        with pytest.raises(PlatformError, match="404 Not Found"):
+            stream_cli_command_to_file("glab", ["api", "x"], dest, "glab not found")
+
+        assert not dest.exists()
+
+    @patch("subprocess.run")
+    def test_raises_platform_error_when_binary_missing(
+        self, mock_run: Mock, tmp_path: Path
+    ) -> None:
+        """Missing binary raises PlatformError with the provided not_found_msg."""
+        mock_run.side_effect = FileNotFoundError("No such file or directory: 'glab'")
+        dest = tmp_path / "artifacts.zip"
+
+        with pytest.raises(PlatformError, match="glab not found"):
+            stream_cli_command_to_file("glab", ["api", "x"], dest, "glab not found")
+
+        assert not dest.exists()

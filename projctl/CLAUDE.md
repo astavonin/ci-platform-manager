@@ -27,6 +27,7 @@ projctl/
 ├── config.py                  # Multi-platform configuration
 ├── exceptions.py              # PlatformError and custom exceptions
 ├── handlers/                  # Modular operation handlers
+│   ├── artifacts_handler.py   # Download CI job artifacts (GitLab)
 │   ├── comment.py             # Post MR/PR review comments
 │   ├── creator.py             # Create issues/epics/milestones (GitLab)
 │   ├── github_creator.py      # Create issues (GitHub)
@@ -506,6 +507,32 @@ projctl pipeline-debug --job-id 5946580
 ```
 
 **Handler:** `handlers/pipeline_handler.py` — `PipelineHandler` class
+
+### CI Job Artifacts
+
+Download files a CI job archived as artifacts. GitLab only. Complements `pipeline-debug`, which fetches job *logs* (a text trace); this fetches the archived *files*.
+
+**Single file** — pulls one path out of the job's archive:
+
+```bash
+projctl artifacts --job-id 12345 --path build/server.stdout
+projctl artifacts --job-id 12345 --path build/server.stdout --dest ./out
+```
+
+**Whole archive** — downloads and extracts everything, for when the archive's layout is unknown:
+
+```bash
+projctl artifacts --job-id 12345
+projctl artifacts --job-id 12345 --dest ./out
+```
+
+**Behavior notes:**
+- `--dest` defaults to the current directory and is created if missing.
+- A single file is written to `<dest>/<path>`, mirroring the archive's directory layout rather than flattening to a basename — two artifacts can share a basename across directories, and flattening would silently overwrite one.
+- The full-archive path streams to `<dest>/artifacts.zip` without buffering in memory, then extracts via `ZipFile.extractall()` (which sanitizes member names, making extraction zip-slip safe).
+- Artifact payloads are binary, so this command uses the binary-safe transport in `utils/glab_runner.py` (`run_glab_command_binary`, `stream_glab_command_to_file`) rather than the shared `text=True` path, which corrupts or raises on non-UTF-8 bytes.
+
+**Handler:** `handlers/artifacts_handler.py` — `ArtifactsHandler` class
 
 ### Wiki Management
 
