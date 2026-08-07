@@ -3,6 +3,7 @@
 import json
 import subprocess
 from pathlib import Path
+from typing import Any, Dict
 from unittest.mock import Mock, patch
 
 import pytest
@@ -620,3 +621,242 @@ class TestDeriveEpicDates:
 
         assert result["start_date"] is None
         assert result["end_date"] is None
+
+
+class TestLoadMrComments:
+    """Test MR comment loading, including thread identity."""
+
+    _RAW_DISCUSSIONS = [
+        {
+            "id": "thread-abc123",
+            "notes": [
+                {
+                    "id": 9001,
+                    "system": False,
+                    "body": "Major: this assertion is not scoped to the build job",
+                    "resolvable": True,
+                    "resolved": False,
+                    "author": {"name": "Reviewer One"},
+                    "position": {"new_path": "ci/audit.py", "new_line": 42},
+                    "created_at": "2026-08-07T09:00:00Z",
+                },
+                # An author reply in the same thread — the shape that distinguishes a
+                # per-thread id from a per-note one.
+                {
+                    "id": 9004,
+                    "system": False,
+                    "body": "Scoped it to the build job",
+                    "resolvable": True,
+                    "resolved": False,
+                    "author": {"name": "Author"},
+                    "position": {"new_path": "ci/audit.py", "new_line": 42},
+                    "created_at": "2026-08-07T09:10:00Z",
+                },
+            ],
+        },
+        {
+            "id": "thread-def456",
+            "notes": [
+                {
+                    "id": 9002,
+                    "system": True,
+                    "body": "assigned to @someone",
+                    "author": {"name": "GitLab"},
+                },
+                {
+                    "id": 9003,
+                    "system": False,
+                    "body": "General remark, not on a diff line",
+                    "resolvable": False,
+                    "resolved": False,
+                    "author": {"name": "Reviewer Two"},
+                    "created_at": "2026-08-07T09:05:00Z",
+                },
+            ],
+        },
+    ]
+
+    def _load_full(self, new_config_path: Path, discussions: Any = None) -> Dict[str, Any]:
+        """Run load_mr_comments() against the subprocess boundary and return the envelope."""
+        loader = TicketLoader(Config(new_config_path))
+        payload = self._RAW_DISCUSSIONS if discussions is None else discussions
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                Mock(stdout=json.dumps({"iid": 235}), returncode=0),
+                Mock(stdout=json.dumps(payload), returncode=0),
+            ]
+            return loader.load_mr_comments("235")
+
+    def _load(self, new_config_path: Path) -> list:
+        return self._load_full(new_config_path)["comments"]
+
+    def test_each_comment_carries_its_enclosing_thread_id(self, new_config_path: Path) -> None:
+        """`resolve:`/`replies:` in a review YAML take the discussion id, not the note
+        id, so dropping it makes the loaded output unusable for resolving a thread."""
+        comments = self._load(new_config_path)
+
+        assert [c["discussion_id"] for c in comments] == [
+            "thread-abc123",
+            "thread-abc123",
+            "thread-def456",
+        ]
+
+    def test_all_notes_in_one_thread_share_that_thread_id(self, new_config_path: Path) -> None:
+        """Every note in a discussion carries the discussion's id, not its own.
+
+        A per-note id would pass any single-note fixture yet make a reply to the
+        second note POST to /discussions/<note_id>, which GitLab 404s.
+        """
+        comments = self._load(new_config_path)
+        first, reply = comments[0], comments[1]
+
+        assert first["discussion_id"] == reply["discussion_id"] == "thread-abc123"
+        assert first["id"] != reply["id"]
+
+    def test_note_id_and_thread_id_stay_distinct(self, new_config_path: Path) -> None:
+        """The two ids address different resources; one must never stand in for the
+        other, since the discussions endpoint rejects a note id."""
+        comments = self._load(new_config_path)
+
+        assert comments[0]["id"] == 9001
+        assert comments[0]["discussion_id"] == "thread-abc123"
+
+    def test_system_notes_are_still_filtered_out(self, new_config_path: Path) -> None:
+        """Threading data must not resurrect the system notes the loader excludes."""
+        comments = self._load(new_config_path)
+
+        assert len(comments) == 3
+        assert all("assigned to" not in c["body"] for c in comments)
+
+    def test_thread_id_defaults_to_empty_when_absent(self, new_config_path: Path) -> None:
+        """A discussion without an id must not raise — the note is still worth showing."""
+        comments = self._load_full(
+            new_config_path, [{"notes": [{"id": 1, "system": False, "body": "hi"}]}]
+        )["comments"]
+
+        assert comments[0]["discussion_id"] == ""
+
+    def test_explicit_null_thread_id_becomes_empty_string(self, new_config_path: Path) -> None:
+        """A JSON null must normalize to "" like a missing key does.
+
+        dict.get(key, "") returns None for an explicit null, which would violate the
+        str type load_mr_comments() documents for discussion_id.
+        """
+        comments = self._load_full(
+            new_config_path,
+            [{"id": None, "notes": [{"id": 1, "system": False, "body": "hi"}]}],
+        )["comments"]
+
+        assert comments[0]["discussion_id"] == ""
+
+    def test_comment_dict_shape(self, new_config_path: Path) -> None:
+        """Full contract of one comment dict.
+
+        TestLoadMrComments is the only coverage load_mr_comments() has anywhere in
+        the suite, so any key not asserted here can drift or disappear silently.
+        """
+        comments = self._load(new_config_path)
+
+        assert comments[0] == {
+            "id": 9001,
+            "discussion_id": "thread-abc123",
+            "author": "Reviewer One",
+            "body": "Major: this assertion is not scoped to the build job",
+            "resolvable": True,
+            "resolved": False,
+            "file_path": "ci/audit.py",
+            "line": 42,
+            "created_at": "2026-08-07T09:00:00Z",
+        }
+
+    def test_positionless_note_emits_empty_file_path_and_line(self, new_config_path: Path) -> None:
+        """A note with no `position` yields empty strings, not placeholders.
+
+        The formatter's regression fixture for the thread-id defect hard-codes
+        file_path="" / line="" as the shape a top-level note takes, so that guard
+        is only as good as this producer-side assertion.
+        """
+        comments = self._load(new_config_path)
+
+        assert comments[2] == {
+            "id": 9003,
+            "discussion_id": "thread-def456",
+            "author": "Reviewer Two",
+            "body": "General remark, not on a diff line",
+            "resolvable": False,
+            "resolved": False,
+            "file_path": "",
+            "line": "",
+            "created_at": "2026-08-07T09:05:00Z",
+        }
+
+    def test_discussions_are_fetched_with_the_note_list_argv(self, new_config_path: Path) -> None:
+        """`mr note list` is what returns discussion objects; `mr view` returns none.
+
+        The mock replays responses by call order, so every other test here passes
+        whatever subcommand is issued — this is the only assertion pinning it.
+        """
+        loader = TicketLoader(Config(new_config_path))
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                Mock(stdout=json.dumps({"iid": 235}), returncode=0),
+                Mock(stdout=json.dumps(self._RAW_DISCUSSIONS), returncode=0),
+            ]
+            loader.load_mr_comments("235")
+
+        assert mock_run.call_args_list[1].args[0] == [
+            "glab",
+            "mr",
+            "note",
+            "list",
+            "235",
+            "--output",
+            "json",
+        ]
+
+    def test_envelope_carries_mr_metadata(self, new_config_path: Path) -> None:
+        """print_mr_info() does `print_mr(data["mr"])`, so an empty envelope is not
+        enough — the metadata itself has to survive."""
+        result = self._load_full(new_config_path)
+
+        assert result["mr"] == {"iid": 235}
+
+    def test_print_mr_info_includes_comment_thread_id(self, new_config_path: Path, capsys) -> None:
+        """Composition test for the path the CLI actually runs: load_mr_comments()
+        feeding print_mr_info(..., with_comments=True). The two halves are tested in
+        isolation elsewhere, which cannot catch the producer and consumer drifting
+        apart — e.g. a key rename on one side with only that side's tests updated.
+
+        Covers the unresolvable thread too: that is the shape the recorded observed
+        failure was about, and it is otherwise guarded only by a hand-built fixture.
+        """
+        data = self._load_full(new_config_path)
+        TicketLoader(Config(new_config_path)).print_mr_info(data, with_comments=True)
+
+        out = capsys.readouterr().out
+        assert "thread: thread-abc123" in out
+        assert "thread: thread-def456" in out
+
+    def test_print_mr_info_omits_comments_when_not_requested(
+        self, new_config_path: Path, capsys
+    ) -> None:
+        """Without --comments the listing must not appear.
+
+        `cli.py` passes the flag straight through, so a gate that ignores it would
+        print review comments on every plain `projctl load mr N`.
+        """
+        data = self._load_full(new_config_path)
+        TicketLoader(Config(new_config_path)).print_mr_info(data, with_comments=False)
+
+        out = capsys.readouterr().out
+        assert "thread: thread-abc123" not in out
+        assert "Review Comments" not in out
+
+    def test_load_mr_comments_propagates_platform_error(self, new_config_path: Path) -> None:
+        """Pins the method's error contract against its declared `Raises`: unlike
+        _get_status_history, which swallows PlatformError and returns [], this method
+        must propagate it rather than silently returning partial data."""
+        loader = TicketLoader(Config(new_config_path))
+        with patch.object(loader, "_run_glab_command", side_effect=PlatformError("fail")):
+            with pytest.raises(PlatformError):
+                loader.load_mr_comments("235")

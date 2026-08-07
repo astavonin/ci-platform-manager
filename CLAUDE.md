@@ -469,7 +469,14 @@ findings:
 replies:
   - discussion_id: "abc123def456"
     body: "Fixed in the latest commit."
+
+resolve:
+  - discussion_id: "abc123def456"
 ```
+
+**Where `discussion_id` comes from:** `projctl load mr <N> --comments` prints it under each comment as `` `thread: <id>` ``. It is the enclosing *thread's* id, not the note's — the `/discussions/:id` endpoints reject a note id. Every note in one thread shares the same value.
+
+`replies:` works on any thread, including an unresolvable top-level comment (GitLab promotes an individual note to a thread on reply). `resolve:` only works on resolvable threads — the ones marked 🔴 or ✅ in the comment listing. An unmarked comment is an individual note and cannot be resolved.
 
 **`approval` field behaviour:**
 - `approved` (default): calls `glab mr approve` after posting comments. Already-approved MRs are treated as success.
@@ -478,7 +485,7 @@ replies:
 
 **Exit codes:**
 - 0: All comments posted and approval action succeeded (or was already in the desired state).
-- 1: One or more comments failed to post, or the approval action failed.
+- 1: One or more comments failed to post, a thread failed to resolve, or the approval action failed.
 
 **Create merge request:**
 ```bash

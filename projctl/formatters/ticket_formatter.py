@@ -308,6 +308,11 @@ def print_mr_comments(comments: List[Dict[str, Any]]) -> None:
         resolved = comment.get("resolved", False)
         status = " ✅" if resolved else (" 🔴" if resolvable else "")
         print(f"**{author}**{location}{status}\n")
+        # Not gated on `resolvable`: an unresolvable top-level note is still a valid
+        # `replies:` target, so withholding its id here would strand it.
+        discussion_id = comment.get("discussion_id", "")
+        if discussion_id:
+            print(f"`thread: {discussion_id}`\n")
         print(comment.get("body", ""))
         print()
 

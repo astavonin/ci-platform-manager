@@ -846,10 +846,22 @@ class TicketLoader:
 
         Returns:
             Dictionary with keys ``mr`` (metadata) and ``comments`` (list of dicts with
-            keys: id, author, body, resolvable, resolved, file_path, line).
+            keys: id, discussion_id, author, body, resolvable, resolved, file_path, line,
+            created_at).
+
+            ``discussion_id`` (str) — the enclosing thread's id, not the note's. It is
+            what the ``resolve:`` and ``replies:`` entries of a review YAML take (see
+            ``handlers/comment.py``); ``id`` identifies a single note and is rejected
+            by those endpoints, so both are returned rather than one standing in for
+            the other.
+
+            ``note["id"]`` is read without a default and ``discussion.get("id")``
+            degrades to ``""``; the ``KeyError`` this makes possible is documented
+            below rather than converted.
 
         Raises:
             PlatformError: If loading fails.
+            KeyError: If a note payload omits its own ``id``.
         """
         mr_ref = self._normalize_mr_ref(mr_ref)
         logger.debug("Loading MR !%s comments", mr_ref)
@@ -871,6 +883,9 @@ class TicketLoader:
                 comments.append(
                     {
                         "id": note["id"],
+                        # dict.get(key, "") returns None for an explicit JSON null,
+                        # which would violate the str type documented above.
+                        "discussion_id": discussion.get("id") or "",
                         "author": note.get("author", {}).get("name", "Unknown"),
                         "body": body,
                         "resolvable": note.get("resolvable", False),
