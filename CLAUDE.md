@@ -38,7 +38,8 @@ projctl/
 │   ├── updater.py       # Update issues/MRs/epics/milestones
 │   ├── search.py        # Search operations
 │   ├── comment.py       # Post MR comments
-│   └── mr_handler.py    # Create merge requests
+│   ├── mr_handler.py    # Create merge requests
+│   └── timelog.py       # Report own logged time
 ├── utils/               # Shared utilities
 │   ├── config_migration.py
 │   ├── git_helpers.py
@@ -494,6 +495,26 @@ projctl create-mr --fill --reviewer alice --label "type::feature"
 projctl create-mr --target-branch develop --milestone "v2.0"
 projctl create-mr --dry-run
 ```
+
+### Timelog
+
+Report your own logged time for a date or an inclusive date range. Read-only. GitLab only.
+
+```bash
+projctl timelog                                  # today
+projctl timelog 2026-08-05                       # that day
+projctl timelog 2026-08-05 --to 2026-08-12       # inclusive interval
+```
+
+The date window is local calendar days (built from the machine's system timezone, no config key or flag), never deduplicates entries, and hard-errors if the authenticated GitLab user cannot be resolved rather than silently reporting an empty result. Rows gain a project-name prefix once the queried window spans multiple projects, and an entry with neither an issue nor an MR attached renders as `(no issue/MR) <project>` rather than being dropped.
+
+Pagination follows `pageInfo.hasNextPage`/`endCursor` and is capped at 200 pages (20,000 entries). Three shapes are hard errors rather than a silently truncated report: `hasNextPage=true` with no usable cursor to continue from, a page repeating a cursor already seen this call, and exceeding the 200-page cap — each names the likely cause and suggests narrowing the date window.
+
+The printed grand total is always the sum of the report's own rows, never the server's. GitLab's server-computed `totalSpentTime` (from the first page where it is present) is used only as a cross-check, logged as a warning on disagreement — which can happen legitimately, since GitLab computes it *before* authorization filtering ([gitlab-org/gitlab#425747](https://gitlab.com/gitlab-org/gitlab/-/issues/425747)).
+
+`timelog` runs with no config file present anywhere; commands that construct `Config` hard-fail on its `FileNotFoundError`, and `timelog` never does — it needs no `default_group` or project scope, is GitLab-only by nature, and has its own `currentUser` host guard.
+
+**Handler:** `handlers/timelog.py` — `TimelogHandler` class
 
 ### Planning Folder Synchronization
 

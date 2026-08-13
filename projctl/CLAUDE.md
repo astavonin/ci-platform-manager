@@ -41,6 +41,7 @@ projctl/
 │   ├── pipeline_handler.py    # Debug failed pipeline jobs (GitLab)
 │   ├── search.py              # Search operations (GitLab)
 │   ├── sync.py                # Planning folder sync (Google Drive)
+│   ├── timelog.py             # Report own logged time (GitLab)
 │   ├── updater.py             # Update issues/MRs/epics/milestones (GitLab)
 │   └── wiki.py                # Manage GitLab project wiki pages
 ├── utils/                     # Shared utilities
@@ -495,6 +496,32 @@ Reference formats accepted per resource type:
 **Epic transport:** issue and MR notes use the REST `POST /projects/:id/{issues,merge_requests}/:iid/notes` endpoint. Epic notes go via the GraphQL `createNote` mutation against the epic's backing `WorkItem` GID — GitLab 15.9+ has migrated group epics to work items, and the REST group-epic notes endpoint returns 404. The handler resolves the `work_item_id` via a REST GET on the epic first, then posts via GraphQL.
 
 **Handler:** `handlers/note.py` — `NoteHandler` class
+
+### Timelog
+
+Report your own logged time for a date or an inclusive date range. Read-only — never creates or modifies a timelog. GitLab only.
+
+```bash
+projctl timelog                                  # today
+projctl timelog 2026-08-05                       # that day
+projctl timelog 2026-08-05 --to 2026-08-12       # inclusive interval
+```
+
+Output is a per-day total, a per-issue (or per-MR) breakdown within each day, and a grand total across the window — always preceded by the exact window queried and the GitLab identity queried as, even when the result is empty. A zero result is reported as "no timelogs returned for this window", never as a confident "you logged nothing", because an empty result caused by `glab` resolving the wrong host would look identical otherwise.
+
+**Behavior notes:**
+- The date window is **local calendar days**, built from the machine's system timezone — not UTC days. There is no config key or flag for the offset; output is machine-dependent by design.
+- Before querying timelogs, the handler resolves the authenticated user via GraphQL `currentUser`. A `null` result is a **hard error** naming the likely cause (`glab` resolved to a host with no GitLab remote in the current directory), not an empty report — this is the command's main safety property, since a misdirected query would otherwise look exactly like "nothing logged".
+- Entries are **never deduplicated**: two timelogs with identical timestamp and duration on the same issue in the same day are both counted, since GitLab's own data contains exactly that shape.
+- An entry attached to a merge request rather than an issue (`issue: null`, `mergeRequest` populated) renders with an `!N` marker instead of being dropped.
+- An entry with neither `issue` nor `mergeRequest` set (the schema allows both to be absent) renders as `(no issue/MR) <project>` instead of being dropped.
+- Rows gain a project-name prefix (e.g. `alpha #11 Fix bug`) once the **queried window** — not the individual day — spans more than one project; a single-project window renders with no prefix, unchanged from before this behavior existed. Two projects whose short names collide (e.g. `team-a/docs` and `team-b/docs` both ending in `docs`) fall back to their full path as the prefix instead of rendering identical, indistinguishable rows.
+- Results are paginated via `pageInfo.hasNextPage`/`endCursor`, never bounded on the connection's `count` field, which GitLab's own schema documents as saturating at "limit + 1" once the filtered set exceeds the page size. Pagination is capped at 200 pages (20,000 entries) — a legitimately reachable window, not just a safety margin. A page reporting `hasNextPage=true` with no usable cursor to continue from, a page repeating a cursor already seen this call, or exceeding the 200-page cap are all hard errors rather than a silently truncated report at exit code 0; each names the likely cause and suggests narrowing the date window.
+- The printed grand total is always the sum of the report's own rows, never the server's. GitLab's server-computed `totalSpentTime` — read once, from the first page where the key is present — is used only as a cross-check, logged as a warning when it disagrees and skipped when absent or unparsable. Disagreement can be legitimate: GitLab computes `totalSpentTime` *before* authorization filtering ([gitlab-org/gitlab#425747](https://gitlab.com/gitlab-org/gitlab/-/issues/425747)), so a user who can no longer see every timelog they logged (e.g. after losing access to an issue) will see a server total that includes entries their own rows can't.
+- `timelog` runs with **no config file present anywhere** — every command that constructs `Config` hard-fails on its `FileNotFoundError`, and `timelog` never does (it needs no `default_group` or project scope to resolve, is GitLab-only by nature, and has its own host guard — the `currentUser` null check above). An absent config only skips the fast platform-gate rejection; an explicitly-named `--config` path that does not exist is still a hard error.
+- No `--dry-run` flag — the command is read-only, matching the convention used by `load`, `search`, and `sync status`.
+
+**Handler:** `handlers/timelog.py` — `TimelogHandler` class
 
 ### Pipeline Debugging
 

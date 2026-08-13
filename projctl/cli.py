@@ -34,6 +34,7 @@ from .handlers.mr_handler import cmd_create_mr
 from .handlers.pipeline_handler import PipelineHandler
 from .handlers.search import SearchHandler
 from .handlers.sync import PlanningSyncHandler
+from .handlers.timelog import TimelogHandler
 from .handlers.updater import TicketUpdater
 from .handlers.wiki import WikiHandler
 
@@ -1120,6 +1121,84 @@ def cmd_note(args) -> int:
         return 1
 
 
+def _add_timelog_subparser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the 'timelog' subcommand."""
+    p = subparsers.add_parser(
+        "timelog",
+        help="Report your own logged time for a date or date range (GitLab only)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  timelog
+  timelog 2026-08-05
+  timelog 2026-08-05 --to 2026-08-12
+        """,
+    )
+    p.add_argument(
+        "date",
+        type=str,
+        nargs="?",
+        default=None,
+        help="Date to report, YYYY-MM-DD (default: today, local time)",
+    )
+    p.add_argument(
+        "--to",
+        type=str,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="End date for an inclusive range (default: same as 'date')",
+    )
+
+
+def cmd_timelog(args) -> int:
+    """Handle the 'timelog' subcommand.
+
+    Read-only, so unlike the mutating commands this has no --dry-run flag.
+
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        Exit code (0 for success, 1 for error).
+    """
+    try:
+        config_path = Path(args.config) if args.config else None
+        config: Config | None
+        try:
+            config = Config(config_path)
+        except FileNotFoundError:
+            if config_path is not None:
+                # An explicitly-named --config path that doesn't exist is
+                # still a hard error — only the auto-search case below is
+                # forgiving.
+                raise
+            # timelog needs no config at all (TimelogHandler takes none — no
+            # default_group or project scope to resolve), and it is GitLab-only
+            # by nature. The platform gate below exists purely as a fast,
+            # friendly rejection; when no config file exists anywhere in the
+            # search order, there is nothing to gate on, and the GraphQL
+            # currentUser host guard inside TimelogHandler.report() already
+            # fails loudly on a non-GitLab host. Treating "no config found" as
+            # a hard error here made the command unusable in every directory
+            # that has no user-wide config file — including every GitLab repo
+            # without a local projctl.yaml.
+            config = None
+
+        if config is not None and config.platform != "gitlab":
+            logger.error("Error: 'timelog' command is only supported for GitLab")
+            return 1
+
+        handler = TimelogHandler()
+        handler.report(args.date, args.to)
+        return 0
+    except FileNotFoundError as err:
+        logger.error(str(err))
+        return 1
+    except (PlatformError, ValueError) as err:
+        logger.error("Error: %s", err)
+        return 1
+
+
 def _add_labels_subparser(subparsers: argparse._SubParsersAction) -> None:
     """Register the 'labels' subcommand."""
     subparsers.add_parser(
@@ -1328,6 +1407,7 @@ Examples:
   %(prog)s update issue 231 --title "New title"
   %(prog)s note issue 340 --body "Closing as false-positive."
   %(prog)s note epic &70 --body "Closed: different approach."
+  %(prog)s timelog 2026-08-05 --to 2026-08-12
   %(prog)s pipeline-debug
   %(prog)s artifacts --job-id 12345 --path .build-12345/server.stdout
   %(prog)s config
@@ -1356,6 +1436,7 @@ Documentation:
     _add_artifacts_subparser(subparsers)
     _add_wiki_subparser(subparsers)
     _add_note_subparser(subparsers)
+    _add_timelog_subparser(subparsers)
     _add_labels_subparser(subparsers)
     _add_config_subparser(subparsers)
 
@@ -1384,6 +1465,7 @@ Documentation:
         "artifacts": cmd_artifacts,
         "wiki": cmd_wiki,
         "note": cmd_note,
+        "timelog": cmd_timelog,
         "labels": cmd_labels,
         "config": cmd_config,
     }

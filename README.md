@@ -23,7 +23,7 @@ The `comment` command is the bridge between a `code-review.md` artifact and the 
 
 `projctl sync` rsyncs the local `./planning/` folder to Google Drive with drift detection: `sync status` reports `in-sync`, `local-ahead`, `remote-ahead`, or `diverged` before any files move, so switching machines starts from a known state. This is what keeps the workflow's persistent context alive across session resets — pull before starting work, push when finishing, and the same planning tree is available on the next machine.
 
-Utilities cover GitLab wiki management, CI pipeline failure log retrieval, label inspection, and configuration introspection.
+Utilities cover GitLab wiki management, CI pipeline failure log retrieval, label inspection, configuration introspection, and a read-only `timelog` report of your own logged time by day and issue.
 
 ## Relationship to genai-automations
 
