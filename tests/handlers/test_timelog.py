@@ -5,6 +5,7 @@ import os
 import re
 import time as time_module
 from datetime import date, datetime, timedelta, timezone
+from typing import Dict, Set
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,7 +13,10 @@ import pytest
 from projctl.exceptions import PlatformError
 from projctl.handlers.timelog import (
     _CURRENT_USER_QUERY,
+    _ISSUE_GLOBAL_ID_QUERY,
     _MAX_PAGES,
+    _MR_GLOBAL_ID_QUERY,
+    _TIMELOG_CREATE_MUTATION,
     _TIMELOGS_QUERY,
     TimelogHandler,
     _format_duration,
@@ -30,6 +34,17 @@ _PATCH_PATH = "projctl.handlers.timelog.run_glab_command"
 # UTC+6, matching the offset used throughout the research corpus this
 # feature was designed against.
 _FIXED_TZ = timezone(timedelta(hours=6))
+
+# The frozen reference instant _make_handler() sets as the write path's "now"
+# by default. Every fixed --date fixture used with add() elsewhere in this
+# module ("2026-08-05") is a date strictly before this one, so under the
+# default it is always in the past relative to "now" — the clamp introduced
+# for the future-date/today-clamp fix never fires for those tests, and their
+# spentAt assertions (bare _local_noon(day), unclamped) stay valid regardless
+# of the real wall-clock date the suite happens to run under. Tests that
+# specifically exercise "today" or "the future" override handler._now
+# themselves rather than relying on this default.
+_FIXED_NOW = datetime(2026, 8, 20, 15, 0, 0, tzinfo=_FIXED_TZ)
 
 # Tests that inject a named zone (e.g. "Asia/Dhaka") via the system_tz
 # fixture depend on the host having the IANA tzdata to resolve it — glibc
@@ -138,7 +153,13 @@ def _bare_project_node(time_spent=900, spent_at="2026-08-05T11:00:00Z", project=
 
 
 def _make_handler() -> TimelogHandler:
-    return TimelogHandler(tz=_FIXED_TZ)
+    handler = TimelogHandler(tz=_FIXED_TZ)
+    # Freeze "now" so add()'s future-date rejection and today-clamp are
+    # deterministic regardless of the real wall clock the suite runs under
+    # — see _FIXED_NOW's own comment for why this default is safe for every
+    # existing fixed --date value used with add() in this module.
+    handler._now = lambda: _FIXED_NOW  # pylint: disable=protected-access
+    return handler
 
 
 # ---------------------------------------------------------------------------
@@ -1666,13 +1687,21 @@ class TestDateArguments:
     def test_no_date_defaults_to_a_single_day_window(self, mock_run: MagicMock, capsys) -> None:
         """Omitting both date and --to reports on 'today' as production resolves it, pinned to
         a known instant rather than recomputed by re-calling the same production expression —
-        which would trivially agree with itself and could also race local midnight."""
+        which would trivially agree with itself and could also race local midnight.
+
+        Constructs TimelogHandler directly rather than via _make_handler(): that helper
+        overrides handler._now with a fixed lambda that ignores the datetime.now() mock
+        below entirely, which would make this test pass regardless of what report() actually
+        does with its default-date expression — report() now goes through the same _now()
+        seam add() uses (see the Low-severity clock-source finding), so patching
+        datetime.now() directly here exercises the real, unoverridden implementation.
+        """
         fixed_now = datetime(2026, 8, 5, 12, 0, 0, tzinfo=_FIXED_TZ)
         mock_run.side_effect = [
             _current_user_response(),
             _timelogs_response([], has_next_page=False),
         ]
-        handler = _make_handler()
+        handler = TimelogHandler(tz=_FIXED_TZ)
 
         with patch("projctl.handlers.timelog.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
@@ -1976,3 +2005,1565 @@ class TestNegativeDurationReport:
         out = capsys.readouterr().out
         assert "2026-08-05 — -30m" in out
         assert "Total: -30m across 1 day(s), 1 entry" in out
+
+
+# ---------------------------------------------------------------------------
+# write path — helpers
+# ---------------------------------------------------------------------------
+
+_GIT_HELPERS_PATCH_PATH = "projctl.handlers.timelog.get_current_repo_path"
+_GITLAB_BASE_URL_PATCH_PATH = "projctl.handlers.timelog.get_gitlab_base_url"
+
+# A GitLab-shaped host, distinct from the git remotes used throughout this
+# module for project-path resolution, so a test asserting on the resolved
+# host can't be satisfied by a lucky path/host mixup.
+_FIXED_GITLAB_HOST = "gitlab.example.com"
+
+
+@pytest.fixture(autouse=True)
+def _default_gitlab_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default get_gitlab_base_url() to a GitLab-shaped host for every test in this module.
+
+    add() calls get_gitlab_base_url() whenever a bare/prefixed target reference falls back
+    to the git remote for project scope (see TestAddHostBinding below). Without this
+    fixture, every such test would instead shell out to the *real* git remote of whatever
+    repository the suite happens to run inside, making outcomes depend on ambient
+    repository state rather than the fixed inputs the test declares — precisely the
+    ambient-state trap this project's own git_helpers tests guard against elsewhere.
+    Tests that specifically exercise host resolution (a GitHub remote, an unresolvable
+    remote, a URL's own host) override this within their own body via
+    _GITLAB_BASE_URL_PATCH_PATH.
+    """
+    monkeypatch.setattr(_GITLAB_BASE_URL_PATCH_PATH, lambda: f"https://{_FIXED_GITLAB_HOST}")
+
+
+def _global_id_response(kind: str, gid: str = "gid://gitlab/Issue/999") -> str:
+    field = "issue" if kind == "issue" else "mergeRequest"
+    return json.dumps({"data": {"project": {field: {"id": gid}}}})
+
+
+def _timelog_create_response(errors=None, timelog_id="1") -> str:
+    errors = errors or []
+    payload: dict = {"errors": errors}
+    payload["timelog"] = None if errors else {"id": timelog_id}
+    return json.dumps({"data": {"timelogCreate": payload}})
+
+
+def _query_arg(cmd: list) -> str:
+    """Return the 'query=...' argument from a glab api graphql command list."""
+    return next(a for a in cmd if a.startswith("query="))
+
+
+def _variable_arg(cmd: list, name: str) -> str:
+    """Return the value of a '-f name=value' GraphQL variable field from a glab command list.
+
+    Every user- or server-controlled value the write path sends (issuableId,
+    timeSpent, spentAt, summary) travels as a typed variable, never
+    interpolated into the query text — this helper asserts against the
+    variable field itself, not a substring of the query string, so a
+    regression back to string interpolation would show up as a missing
+    field rather than an unaffected substring match.
+
+    Raises:
+        AssertionError: If no '-f name=...' pair is present in cmd.
+    """
+    prefix = f"{name}="
+    for i, arg in enumerate(cmd):
+        if arg == "-f" and i + 1 < len(cmd) and cmd[i + 1].startswith(prefix):
+            return cmd[i + 1][len(prefix) :]
+    raise AssertionError(f"no -f {name}=... field found in {cmd!r}")
+
+
+def _sent_variable_names(cmd: list) -> Set[str]:
+    """Return the set of GraphQL variable names sent via '-f name=value' in a glab command
+    list, excluding the 'query' field itself (which carries the document, not a variable)."""
+    names = set()
+    for i, arg in enumerate(cmd):
+        if arg == "-f" and i + 1 < len(cmd):
+            name = cmd[i + 1].split("=", 1)[0]
+            if name != "query":
+                names.add(name)
+    return names
+
+
+def _normalized(document: str) -> str:
+    """Collapse a GraphQL document's whitespace to single spaces for substring checks."""
+    return re.sub(r"\s+", " ", document)
+
+
+def _declared_variables(document: str) -> Dict[str, str]:
+    """Return {name: type} for every '$name: Type' declared in the operation's signature.
+
+    Matches only the header segment between 'mutation('/'query(' and its closing ')' —
+    neither document under test nests parentheses inside that segment (no default values),
+    so a non-greedy match to the first ')' is exact, not merely adequate.
+    """
+    header = re.match(r"^(?:mutation|query)\(([^)]*)\)", document)
+    assert header, f"document has no operation-variable signature: {document!r}"
+    declared: Dict[str, str] = {}
+    for piece in header.group(1).split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        name, _sep, type_ = piece.partition(":")
+        declared[name.strip().lstrip("$")] = type_.strip()
+    return declared
+
+
+def _used_variable_names(document: str) -> Set[str]:
+    """Return every '$name' referenced anywhere in the document body, excluding the
+    operation's own variable-declaration header."""
+    header = re.match(r"^(?:mutation|query)\([^)]*\)", document)
+    assert header, f"document has no operation-variable signature: {document!r}"
+    body = document[header.end() :]
+    return set(re.findall(r"\$(\w+)", body))
+
+
+# ---------------------------------------------------------------------------
+# write path — GraphQL document structure (the -f side of a request only
+# proves what projctl sent; these tests assert directly on the document text
+# each -f field is paired with)
+# ---------------------------------------------------------------------------
+
+
+class TestGraphQLDocumentStructure:
+    """Structural assertions on the write path's three GraphQL documents.
+
+    Every other write-path test inspects the outgoing '-f name=value'
+    fields, never the 'query=...' document those fields are meant to bind
+    into — so a document that silently drops a binding, changes a variable's
+    type, or is replaced outright survives unless something here reads the
+    document text itself. The bijection checks make GraphQL's own "All
+    Variables Used" validation rule (a declared-but-unused variable is
+    itself a document error) catch a broken document during review as
+    aggressively as GitLab's real validator does at request time.
+    """
+
+    # -- _TIMELOG_CREATE_MUTATION --------------------------------------
+
+    def test_timelog_create_mutation_operation_keyword_is_mutation(self) -> None:
+        """The document opens with 'mutation(', not 'query(' — timelogCreate does not exist
+        on the Query root, so a query-shaped document would be rejected outright."""
+        assert _TIMELOG_CREATE_MUTATION.startswith("mutation(")
+
+    def test_timelog_create_mutation_declares_the_expected_variable_types(self) -> None:
+        """Each declared variable's type is exact — a widened or narrowed type (e.g.
+        $timeSpent: Int!) is itself a schema-invalid document, independent of any value
+        ever sent for it."""
+        assert _declared_variables(_TIMELOG_CREATE_MUTATION) == {
+            "issuableId": "IssuableID!",
+            "timeSpent": "String!",
+            "spentAt": "Time",
+            "summary": "String!",
+        }
+
+    def test_timelog_create_mutation_declared_and_used_variables_are_a_bijection(self) -> None:
+        """Every declared variable is used, and every used variable is declared — GraphQL's
+        'All Variables Used' rule makes a declared-but-unused variable a document error on
+        its own, so dropping any single 'name: $name' binding while leaving its declaration
+        in place (the exact shape of the escaped 'summary' defect) must turn this red."""
+        assert _declared_variables(_TIMELOG_CREATE_MUTATION).keys() == _used_variable_names(
+            _TIMELOG_CREATE_MUTATION
+        )
+
+    def test_timelog_create_mutation_input_bindings_are_present(self) -> None:
+        """Each 'name: $name' binding inside 'input: {' is present verbatim — the document
+        must actually forward every declared variable into TimelogCreateInput, not merely
+        declare it."""
+        normalized = _normalized(_TIMELOG_CREATE_MUTATION)
+        for binding in (
+            "issuableId: $issuableId",
+            "timeSpent: $timeSpent",
+            "spentAt: $spentAt",
+            "summary: $summary",
+        ):
+            assert binding in normalized, f"missing binding: {binding}"
+
+    def test_timelog_create_mutation_selects_timelog_id(self) -> None:
+        """The payload selection includes 'timelog { id }' — the one field that positively
+        proves a write occurred, which the success check in _create_timelog() depends on
+        being requested at all."""
+        assert "timelog { id }" in _normalized(_TIMELOG_CREATE_MUTATION)
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_timelog_create_mutation_variables_sent_equal_variables_used_in_the_document(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """The set of '-f name=value' fields a real call sends equals the set of '$name'
+        variables the document actually uses — the reverse direction from the bijection test
+        above, tying the document to what production code transmits rather than to itself."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [_global_id_response("issue"), _timelog_create_response()]
+        handler = _make_handler()
+
+        handler.add("478", "2h", date_str="2026-08-05")
+
+        create_cmd = mock_run.call_args_list[1][0][0]
+        assert _sent_variable_names(create_cmd) == _used_variable_names(_TIMELOG_CREATE_MUTATION)
+
+    # -- _ISSUE_GLOBAL_ID_QUERY -----------------------------------------
+
+    def test_issue_global_id_query_operation_keyword_is_query(self) -> None:
+        """The document opens with 'query(', not 'mutation(' — a read-only lookup must never
+        be sent as a mutation."""
+        assert _ISSUE_GLOBAL_ID_QUERY.startswith("query(")
+
+    def test_issue_global_id_query_declares_the_expected_variable_types(self) -> None:
+        """fullPath is ID! and iid is String! — GitLab's schema requires exactly these types
+        for Project.issue(iid:)."""
+        assert _declared_variables(_ISSUE_GLOBAL_ID_QUERY) == {
+            "fullPath": "ID!",
+            "iid": "String!",
+        }
+
+    def test_issue_global_id_query_declared_and_used_variables_are_a_bijection(self) -> None:
+        """Same 'All Variables Used' property as the mutation — dropping 'fullPath:
+        $fullPath' from project(...) while leaving the declaration in place must turn red."""
+        assert _declared_variables(_ISSUE_GLOBAL_ID_QUERY).keys() == _used_variable_names(
+            _ISSUE_GLOBAL_ID_QUERY
+        )
+
+    def test_issue_global_id_query_bindings_are_present(self) -> None:
+        """fullPath: $fullPath scopes the project lookup and iid: $iid selects the issue —
+        dropping either binding (leaving the declaration) breaks resolution silently."""
+        normalized = _normalized(_ISSUE_GLOBAL_ID_QUERY)
+        assert "project(fullPath: $fullPath)" in normalized
+        assert "issue(iid: $iid)" in normalized
+
+    def test_issue_global_id_query_selects_the_global_id_field_not_the_local_iid(self) -> None:
+        """The issue selection is exactly '{ id }' — the GraphQL global ID timelogCreate's
+        issuableId argument requires. Selecting '{ iid }' instead would return the local
+        integer iid, which the write path would then forward as issuableId — a value the
+        mutation would reject as a malformed global ID."""
+        assert "issue(iid: $iid) { id }" in _normalized(_ISSUE_GLOBAL_ID_QUERY)
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_issue_global_id_query_variables_sent_equal_variables_used_in_the_document(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """The '-f' fields the resolve call actually sends equal the '$' variables the
+        issue-branch document uses."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [_global_id_response("issue"), _timelog_create_response()]
+        handler = _make_handler()
+
+        handler.add("478", "2h", date_str="2026-08-05")
+
+        resolve_cmd = mock_run.call_args_list[0][0][0]
+        assert _sent_variable_names(resolve_cmd) == _used_variable_names(_ISSUE_GLOBAL_ID_QUERY)
+
+    # -- _MR_GLOBAL_ID_QUERY ----------------------------------------------
+
+    def test_mr_global_id_query_operation_keyword_is_query(self) -> None:
+        """The document opens with 'query(', not 'mutation(' — a read-only lookup must never
+        be sent as a mutation."""
+        assert _MR_GLOBAL_ID_QUERY.startswith("query(")
+
+    def test_mr_global_id_query_declares_the_expected_variable_types(self) -> None:
+        """fullPath is ID! and iid is String! — the same variable contract as the issue
+        query, since both scope a project(fullPath:) lookup."""
+        assert _declared_variables(_MR_GLOBAL_ID_QUERY) == {
+            "fullPath": "ID!",
+            "iid": "String!",
+        }
+
+    def test_mr_global_id_query_declared_and_used_variables_are_a_bijection(self) -> None:
+        """Same 'All Variables Used' property as the issue query — dropping 'fullPath:
+        $fullPath' from project(...) here must turn red independently of the issue branch."""
+        assert _declared_variables(_MR_GLOBAL_ID_QUERY).keys() == _used_variable_names(
+            _MR_GLOBAL_ID_QUERY
+        )
+
+    def test_mr_global_id_query_bindings_are_present(self) -> None:
+        """fullPath: $fullPath scopes the project lookup and iid: $iid selects the merge
+        request — dropping either binding breaks resolution silently."""
+        normalized = _normalized(_MR_GLOBAL_ID_QUERY)
+        assert "project(fullPath: $fullPath)" in normalized
+        assert "mergeRequest(iid: $iid)" in normalized
+
+    def test_mr_global_id_query_selects_the_global_id_field_not_the_local_iid(self) -> None:
+        """The mergeRequest selection is exactly '{ id }', mirroring the issue branch's own
+        selection-set assertion — the mergeRequest branch must independently guard against
+        the same '{ iid }' regression."""
+        assert "mergeRequest(iid: $iid) { id }" in _normalized(_MR_GLOBAL_ID_QUERY)
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_mr_global_id_query_variables_sent_equal_variables_used_in_the_document(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """The '-f' fields the resolve call actually sends equal the '$' variables the
+        MR-branch document uses."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [_global_id_response("mr"), _timelog_create_response()]
+        handler = _make_handler()
+
+        handler.add("!235", "30m", date_str="2026-08-05")
+
+        resolve_cmd = mock_run.call_args_list[0][0][0]
+        assert _sent_variable_names(resolve_cmd) == _used_variable_names(_MR_GLOBAL_ID_QUERY)
+
+
+# ---------------------------------------------------------------------------
+# write path — target reference classification
+# ---------------------------------------------------------------------------
+
+
+class TestResolveTarget:
+    """Direct tests for _resolve_target's issue/MR classification, ref parsing, and the
+    host it carries alongside project_path for a full URL reference."""
+
+    def test_bare_digit_is_an_issue(self) -> None:
+        """A plain digit string with no prefix is treated as an issue, with no host of its
+        own — the caller (add()) resolves one from the git remote for this shape."""
+        kind, host, project, iid = TimelogHandler._resolve_target(
+            "478"
+        )  # pylint: disable=protected-access
+        assert (kind, host, project, iid) == ("issue", None, None, "478")
+
+    def test_hash_prefixed_is_an_issue(self) -> None:
+        """'#478' is treated as an issue with the prefix stripped."""
+        kind, host, project, iid = TimelogHandler._resolve_target(
+            "#478"
+        )  # pylint: disable=protected-access
+        assert (kind, host, project, iid) == ("issue", None, None, "478")
+
+    def test_bang_prefixed_is_an_mr(self) -> None:
+        """'!235' is treated as an MR with the prefix stripped."""
+        kind, host, project, iid = TimelogHandler._resolve_target(
+            "!235"
+        )  # pylint: disable=protected-access
+        assert (kind, host, project, iid) == ("mr", None, None, "235")
+
+    def test_issue_url_carries_its_own_project_path_and_host(self) -> None:
+        """A full issue URL resolves its own host alongside the project path and iid,
+        kind 'issue' — the host must never be silently discarded, since add() binds it
+        into --hostname for both GraphQL calls."""
+        kind, host, project, iid = (
+            TimelogHandler._resolve_target(  # pylint: disable=protected-access
+                "https://gitlab.example.com/group/project/-/issues/478"
+            )
+        )
+        assert (kind, host, project, iid) == (
+            "issue",
+            "gitlab.example.com",
+            "group/project",
+            "478",
+        )
+
+    def test_work_items_url_is_an_issue(self) -> None:
+        """A work_items URL (GitLab's newer issue URL form) is also classified as an issue,
+        with its own host resolved too."""
+        kind, host, project, iid = (
+            TimelogHandler._resolve_target(  # pylint: disable=protected-access
+                "https://gitlab.example.com/group/project/-/work_items/478"
+            )
+        )
+        assert (kind, host, project, iid) == (
+            "issue",
+            "gitlab.example.com",
+            "group/project",
+            "478",
+        )
+
+    def test_mr_url_carries_its_own_project_path_and_host(self) -> None:
+        """A full MR URL resolves its own host alongside the project path and iid, kind
+        'mr'."""
+        kind, host, project, iid = (
+            TimelogHandler._resolve_target(  # pylint: disable=protected-access
+                "https://gitlab.example.com/group/project/-/merge_requests/235"
+            )
+        )
+        assert (kind, host, project, iid) == (
+            "mr",
+            "gitlab.example.com",
+            "group/project",
+            "235",
+        )
+
+    def test_bare_reference_carries_no_host(self) -> None:
+        """A bare/prefixed reference (no URL) resolves host as None — it has no host of its
+        own to report, distinct from a URL whose host happens to be unparsable."""
+        _kind, host, _project, _iid = TimelogHandler._resolve_target(
+            "478"
+        )  # pylint: disable=protected-access
+        assert host is None
+
+    def test_unparseable_reference_raises_value_error(self) -> None:
+        """A reference matching neither issue nor MR forms raises ValueError."""
+        with pytest.raises(ValueError, match="Cannot parse target reference"):
+            TimelogHandler._resolve_target("garbage")  # pylint: disable=protected-access
+
+    def test_bang_prefixed_non_numeric_raises_value_error(self) -> None:
+        """'!abc' (non-numeric after stripping the prefix) raises ValueError."""
+        with pytest.raises(ValueError, match="Cannot parse target reference"):
+            TimelogHandler._resolve_target("!abc")  # pylint: disable=protected-access
+
+    def test_hash_prefixed_non_numeric_raises_value_error(self) -> None:
+        """'#abc' (non-numeric after stripping the prefix) raises ValueError — the
+        parse_issue_url half of the isdigit() guard, mirroring the MR-side coverage above."""
+        with pytest.raises(ValueError, match="Cannot parse target reference"):
+            TimelogHandler._resolve_target("#abc")  # pylint: disable=protected-access
+
+    def test_non_ascii_digit_reference_raises_value_error(self) -> None:
+        """A non-ASCII digit string (e.g. Arabic-indic '٤٧٨') is not a valid iid — str.isdigit()
+        alone admits it, but it can never be a real GitLab iid, and forwarding it would send
+        a value GitLab's integer-typed argument cannot parse."""
+        with pytest.raises(ValueError, match="Cannot parse target reference"):
+            TimelogHandler._resolve_target("٤٧٨")  # pylint: disable=protected-access
+
+    def test_unparseable_reference_error_names_accepted_forms(self) -> None:
+        """The parse-failure message lists the accepted forms rather than only the rejected
+        reference — they are finite and known, so the operator should not have to guess."""
+        with pytest.raises(ValueError, match="accepted forms are N, #N"):
+            TimelogHandler._resolve_target("garbage")  # pylint: disable=protected-access
+
+
+# ---------------------------------------------------------------------------
+# write path — local noon (spentAt basis)
+# ---------------------------------------------------------------------------
+
+
+class TestLocalNoon:
+    """Tests for the injected-tz test seam in _local_noon()."""
+
+    def test_no_injected_tz_produces_an_aware_system_local_datetime(self) -> None:
+        """With no injected tz (the production path), the naive value gains the system's offset."""
+        handler = TimelogHandler(tz=None)
+
+        # pylint: disable=protected-access
+        noon = handler._local_noon(date(2026, 8, 5))
+        # pylint: enable=protected-access
+
+        assert noon.tzinfo is not None
+        assert noon.replace(tzinfo=None) == datetime(2026, 8, 5, 12, 0, 0)
+
+    def test_injected_tz_localizes_the_given_day_at_noon(self) -> None:
+        """The spentAt instant reflects the injected tz's offset, at noon on the given day."""
+        handler = _make_handler()  # tz=+06:00
+
+        # pylint: disable=protected-access
+        noon = handler._local_noon(date(2026, 8, 5))
+        # pylint: enable=protected-access
+
+        assert noon.isoformat() == "2026-08-05T12:00:00+06:00"
+
+    @_REQUIRES_TZDATA
+    def test_injected_tz_localizes_rather_than_converts_from_system_tz(self, system_tz) -> None:
+        """Mirrors TestLocalBound's regression: astimezone() would shift noon by (tz offset -
+        system offset) instead of localizing it directly into the injected tz."""
+        system_tz("America/New_York")
+        handler = TimelogHandler(tz=_FIXED_TZ)
+
+        # pylint: disable=protected-access
+        noon = handler._local_noon(date(2026, 8, 5))
+        # pylint: enable=protected-access
+
+        assert noon.isoformat() == "2026-08-05T12:00:00+06:00"
+
+
+class TestNow:
+    """Tests for _now() — every other test in this module monkeypatches the bound method
+    directly, so nothing else exercises the real datetime-based implementation."""
+
+    def test_no_injected_tz_returns_an_instant_comparable_with_local_noon(self) -> None:
+        """With no injected tz (the production path — TimelogHandler() takes no args in
+        cmd_timelog()), _now() must return an aware datetime directly comparable with
+        _local_noon()'s output, since add() computes min(_local_noon(day), self._now()).
+
+        Regression for an observed crash: datetime.now(None) returns a *naive* datetime
+        (tzinfo=None), while _local_noon()'s _localize() attaches the system tzinfo via
+        naive.astimezone(None) even when self._tz is None — comparing the two with min()
+        raised 'TypeError: can't compare offset-naive and offset-aware datetimes' on the
+        very first real invocation of 'projctl timelog add' outside a --dry-run.
+        """
+        handler = TimelogHandler(tz=None)
+
+        # pylint: disable=protected-access
+        now = handler._now()
+        noon = handler._local_noon(now.date())
+        # pylint: enable=protected-access
+
+        assert now.tzinfo is not None
+        min(now, noon)  # must not raise TypeError: offset-naive vs offset-aware
+
+    def test_returns_an_aware_instant_close_to_the_real_wall_clock(self) -> None:
+        """The unmonkeypatched _now() reflects the real system clock, not a fixed value —
+        bounded against a fresh datetime.now() call taken immediately before and after to
+        avoid asserting an exact, inherently racy timestamp."""
+        handler = TimelogHandler(tz=_FIXED_TZ)
+
+        before = datetime.now(_FIXED_TZ)
+        # pylint: disable=protected-access
+        observed = handler._now()
+        # pylint: enable=protected-access
+        after = datetime.now(_FIXED_TZ)
+
+        assert observed.tzinfo is not None
+        assert before <= observed <= after
+
+    @_REQUIRES_TZDATA
+    def test_no_injected_tz_localizes_to_the_system_offset_not_utc(self, system_tz) -> None:
+        """A regression that returned the raw UTC instant without astimezone(self._tz) would
+        still pass test_returns_an_aware_instant_close_to_the_real_wall_clock above — comparing
+        aware datetimes normalizes across tzinfo, so ordering alone is offset-independent and
+        cannot tell 'converted to local' apart from 'still UTC'. Asia/Dhaka has no DST, so its
+        offset is a fixed, easily-distinguished-from-UTC +06:00 regardless of what real time
+        the suite happens to run at: at a positive offset, an unconverted _now() would
+        silently misfile an early-morning entry onto the wrong local day in add()."""
+        system_tz("Asia/Dhaka")  # UTC+6, no DST
+        handler = TimelogHandler(tz=None)
+
+        # pylint: disable=protected-access
+        now = handler._now()
+        # pylint: enable=protected-access
+
+        assert now.utcoffset() == timedelta(hours=6)
+
+
+# ---------------------------------------------------------------------------
+# write path — add()
+# ---------------------------------------------------------------------------
+
+
+class TestAddIssue:
+    """Happy-path tests for logging time against an issue."""
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_bare_digit_ref_resolves_project_from_git_remote(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock, capsys
+    ) -> None:
+        """A bare '478' has no project path of its own, so the git remote supplies it."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("issue", gid="gid://gitlab/Issue/999"),
+            _timelog_create_response(),
+        ]
+        handler = _make_handler()
+
+        handler.add("478", "2h", date_str="2026-08-05")
+
+        mock_repo_path.assert_called_once()
+        assert mock_run.call_count == 2
+        resolve_cmd = mock_run.call_args_list[0][0][0]
+        assert _adjacent_pair_present(resolve_cmd, ["-f", "fullPath=group/project"])
+        assert _adjacent_pair_present(resolve_cmd, ["-f", "iid=478"])
+        assert "issue(iid" in _query_arg(resolve_cmd)
+        create_cmd = mock_run.call_args_list[1][0][0]
+        assert _variable_arg(create_cmd, "issuableId") == "gid://gitlab/Issue/999"
+        out = capsys.readouterr().out
+        assert "Logged 2h to #478 in group/project" in out
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_hash_prefixed_ref_behaves_identically_to_bare_digit(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """'#478' and '478' resolve to the same target."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("issue"),
+            _timelog_create_response(),
+        ]
+        handler = _make_handler()
+
+        handler.add("#478", "2h", date_str="2026-08-05")
+
+        resolve_cmd = mock_run.call_args_list[0][0][0]
+        assert _adjacent_pair_present(resolve_cmd, ["-f", "iid=478"])
+
+    @patch(_PATCH_PATH)
+    def test_full_url_ref_skips_the_git_remote_lookup(self, mock_run: MagicMock) -> None:
+        """A full issue URL already carries its project path — no git remote call is made."""
+        mock_run.side_effect = [
+            _global_id_response("issue"),
+            _timelog_create_response(),
+        ]
+        handler = _make_handler()
+
+        with patch(_GIT_HELPERS_PATCH_PATH) as mock_repo_path:
+            handler.add("https://gitlab.com/alpha/beta/-/issues/478", "2h", date_str="2026-08-05")
+            mock_repo_path.assert_not_called()
+
+        resolve_cmd = mock_run.call_args_list[0][0][0]
+        assert _adjacent_pair_present(resolve_cmd, ["-f", "fullPath=alpha/beta"])
+
+
+class TestAddMergeRequest:
+    """Tests for logging time against a merge request — the second half of the 'one code
+    path once the global ID is resolved' design: the create-timelog call must be identical
+    in shape to the issue case, and only the resolution query differs."""
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_bang_prefixed_ref_resolves_as_a_merge_request(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock, capsys
+    ) -> None:
+        """'!235' resolves via the mergeRequest(iid:) query, not issue(iid:)."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("mr", gid="gid://gitlab/MergeRequest/42"),
+            _timelog_create_response(),
+        ]
+        handler = _make_handler()
+
+        handler.add("!235", "30m", date_str="2026-08-05")
+
+        resolve_cmd = mock_run.call_args_list[0][0][0]
+        assert "mergeRequest(iid" in _query_arg(resolve_cmd)
+        assert "issue(iid" not in _query_arg(resolve_cmd)
+        assert _adjacent_pair_present(resolve_cmd, ["-f", "iid=235"])
+        create_cmd = mock_run.call_args_list[1][0][0]
+        assert _variable_arg(create_cmd, "issuableId") == "gid://gitlab/MergeRequest/42"
+        out = capsys.readouterr().out
+        # '!235', not '#235' or 'mr #235' — MRs must carry their own sigil, matching the
+        # read path's own _target_label() convention.
+        assert "Logged 30m to !235 in group/project" in out
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_full_mr_url_skips_the_git_remote_lookup(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A full MR URL already carries its project path — no git remote call is made."""
+        mock_run.side_effect = [
+            _global_id_response("mr"),
+            _timelog_create_response(),
+        ]
+        handler = _make_handler()
+
+        handler.add(
+            "https://gitlab.com/alpha/beta/-/merge_requests/235", "30m", date_str="2026-08-05"
+        )
+
+        mock_repo_path.assert_not_called()
+        resolve_cmd = mock_run.call_args_list[0][0][0]
+        assert _adjacent_pair_present(resolve_cmd, ["-f", "fullPath=alpha/beta"])
+
+
+class TestAddHostBinding:
+    """Target identity is host *and* project path together, never path alone. A
+    bare/prefixed reference takes both from the git remote; a full URL carries its own of
+    each; a remote resolving to github.com is rejected before any API call; the resolved
+    host travels explicitly on both the resolve query and the mutation via --hostname, so
+    the two calls cannot silently disagree on which GitLab instance they target."""
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_bare_reference_passes_the_git_remote_host_to_both_calls(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A bare reference's host (from get_gitlab_base_url(), not the ambient default
+        glab would otherwise pick) reaches both the resolve query and the create mutation —
+        a disagreement between the two would resolve a global ID on one instance and write
+        against another."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [_global_id_response("issue"), _timelog_create_response()]
+        handler = _make_handler()
+
+        handler.add("478", "2h", date_str="2026-08-05")
+
+        resolve_cmd = mock_run.call_args_list[0][0][0]
+        create_cmd = mock_run.call_args_list[1][0][0]
+        assert _adjacent_pair_present(resolve_cmd, ["--hostname", _FIXED_GITLAB_HOST])
+        assert _adjacent_pair_present(create_cmd, ["--hostname", _FIXED_GITLAB_HOST])
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_full_url_reference_passes_the_urls_own_host_to_both_calls(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A full URL's hostname must not be discarded — _resolve_target() previously
+        returned only the path from a URL like 'https://EVIL.example.com/...', so glab would
+        fall back to its own ambient host resolution instead of the URL's own instance. It
+        must reach --hostname on both calls, and the git-remote fallback must never run."""
+        mock_run.side_effect = [_global_id_response("issue"), _timelog_create_response()]
+        handler = _make_handler()
+
+        handler.add(
+            "https://gitlab.other-instance.example/alpha/beta/-/issues/478",
+            "2h",
+            date_str="2026-08-05",
+        )
+
+        mock_repo_path.assert_not_called()
+        resolve_cmd = mock_run.call_args_list[0][0][0]
+        create_cmd = mock_run.call_args_list[1][0][0]
+        assert _adjacent_pair_present(resolve_cmd, ["--hostname", "gitlab.other-instance.example"])
+        assert _adjacent_pair_present(create_cmd, ["--hostname", "gitlab.other-instance.example"])
+
+    @patch(_PATCH_PATH)
+    def test_full_url_reference_shows_its_host_in_the_dry_run_intent(
+        self, mock_run: MagicMock, capsys
+    ) -> None:
+        """The dry-run preview names the host a real run would target — a preview that hides
+        a mismatched host is worse than none, the same property required of the previewed
+        spentAt value elsewhere in this module."""
+        handler = _make_handler()
+
+        with patch(_GIT_HELPERS_PATCH_PATH) as mock_repo_path:
+            handler.add(
+                "https://gitlab.other-instance.example/alpha/beta/-/issues/478",
+                "2h",
+                date_str="2026-08-05",
+                dry_run=True,
+            )
+            mock_repo_path.assert_not_called()
+
+        mock_run.assert_not_called()
+        out = capsys.readouterr().out
+        assert "gitlab.other-instance.example" in out
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_github_remote_is_rejected_before_any_api_call(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A bare reference whose git remote resolves to github.com must fail before any glab
+        call — get_current_repo_path() accepts any origin regardless of platform, so without
+        this check 'timelog add' run from a GitHub-hosted repository would silently resolve
+        a path there and attempt to log time against it as if it were a GitLab project."""
+        mock_repo_path.return_value = "astavonin/projctl"
+        handler = _make_handler()
+
+        with patch(_GITLAB_BASE_URL_PATCH_PATH, return_value="https://github.com"):
+            with pytest.raises(PlatformError, match="GitHub, not GitLab"):
+                handler.add("1", "2h", date_str="2026-08-05")
+
+        mock_run.assert_not_called()
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_github_remote_is_rejected_even_under_dry_run(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock, capsys
+    ) -> None:
+        """--dry-run makes no glab API calls at all, so glab's own host-auth check (which
+        would otherwise catch an unrecognized host at call time) never runs for it — the
+        github.com rejection must therefore be a client-side check that fires unconditionally,
+        not something --dry-run can silently bypass."""
+        mock_repo_path.return_value = "astavonin/projctl"
+        handler = _make_handler()
+
+        with patch(_GITLAB_BASE_URL_PATCH_PATH, return_value="https://github.com"):
+            with pytest.raises(PlatformError, match="GitHub, not GitLab"):
+                handler.add("1", "2h", date_str="2026-08-05", dry_run=True)
+
+        mock_run.assert_not_called()
+        assert "[dry-run]" not in capsys.readouterr().out
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_unresolvable_git_remote_host_omits_the_hostname_flag(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """When the git remote's host cannot be determined at all (get_gitlab_base_url()
+        returns ''), --hostname is omitted rather than sent as an empty string — glab then
+        falls back to its own ambient resolution, matching this handler's pre-existing
+        behavior for a remote it cannot parse, rather than introducing a new failure mode
+        for an edge case with no known concrete repro."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [_global_id_response("issue"), _timelog_create_response()]
+        handler = _make_handler()
+
+        with patch(_GITLAB_BASE_URL_PATCH_PATH, return_value=""):
+            handler.add("478", "2h", date_str="2026-08-05")
+
+        resolve_cmd = mock_run.call_args_list[0][0][0]
+        create_cmd = mock_run.call_args_list[1][0][0]
+        assert "--hostname" not in resolve_cmd
+        assert "--hostname" not in create_cmd
+
+
+class TestAddNoGitRemote:
+    """The write path fails loudly, not silently, when project scope cannot be resolved."""
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_bare_ref_with_no_git_remote_raises_before_any_api_call(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A bare ref with no git remote to fall back on raises PlatformError, and no glab
+        command is ever run — the failure must be loud, not an empty no-op."""
+        mock_repo_path.return_value = None
+        handler = _make_handler()
+
+        with pytest.raises(PlatformError, match="git repository with a GitLab remote"):
+            handler.add("478", "2h", date_str="2026-08-05")
+
+        mock_run.assert_not_called()
+
+
+class TestAddInputValidation:
+    """add()-level rejection for malformed input, exercised through the public method rather
+    than the private helpers those failures ultimately come from — 'fails before any API
+    call' is otherwise only guarded at the private-helper level, not at the entry point a
+    real caller actually uses."""
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_malformed_reference_raises_before_any_api_call(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A reference _resolve_target() cannot parse raises ValueError from add() itself,
+        before the git-remote fallback or any glab call runs."""
+        handler = _make_handler()
+
+        with pytest.raises(ValueError, match="Cannot parse target reference"):
+            handler.add("garbage", "2h", date_str="2026-08-05")
+
+        mock_repo_path.assert_not_called()
+        mock_run.assert_not_called()
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_malformed_date_raises_before_target_resolution(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A malformed --date value raises the real _parse_date_arg() ValueError — every
+        existing CLI-level test for this instead injects a mocked ValueError into a mocked
+        handler, so the real message and its ordering ahead of target resolution were
+        unverified."""
+        handler = _make_handler()
+
+        with pytest.raises(ValueError, match="YYYY-MM-DD"):
+            handler.add("478", "2h", date_str="not-a-date")
+
+        mock_repo_path.assert_not_called()
+        mock_run.assert_not_called()
+
+
+class TestAddDryRun:
+    """--dry-run must make zero mutating (or any) glab API calls."""
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_dry_run_issues_zero_api_calls_and_prints_intent(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock, capsys
+    ) -> None:
+        """dry_run=True must not call run_glab_command at all — not even the read-only
+        global-ID lookup — while still printing the resolved target and date."""
+        mock_repo_path.return_value = "group/project"
+        handler = _make_handler()
+
+        handler.add("478", "2h", date_str="2026-08-05", dry_run=True)
+
+        mock_run.assert_not_called()
+        out = capsys.readouterr().out
+        assert "[dry-run]" in out
+        assert "2h" in out
+        assert "issue #478" in out
+        assert "group/project" in out
+        assert "2026-08-05" in out
+        assert _FIXED_GITLAB_HOST in out
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_dry_run_still_resolves_project_path_since_that_is_a_local_only_call(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """Resolving the project path via the git remote is a local subprocess call, not a
+        glab API call — dry-run may still do it so the preview shows the real project."""
+        mock_repo_path.return_value = "group/project"
+        handler = _make_handler()
+
+        handler.add("478", "2h", date_str="2026-08-05", dry_run=True)
+
+        mock_repo_path.assert_called_once()
+        mock_run.assert_not_called()
+
+
+class TestAddDryRunMatchesRealSpentAt:
+    """A preview that disagrees with the real request is worse than none.
+    _FIXED_NOW is always after local noon, and every fixed --date fixture elsewhere in this
+    module is safely in the past — both shapes make the today-clamp a structural no-op, so
+    neither can tell a correct preview apart from a stale, unclamped one. This class freezes
+    'now' before local noon on today so the clamp is actually active."""
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_dry_run_spent_at_equals_the_real_paths_spent_at(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock, capsys
+    ) -> None:
+        mock_repo_path.return_value = "group/project"
+        handler = _make_handler()
+        frozen_now = datetime(2026, 8, 13, 9, 41, 0, tzinfo=_FIXED_TZ)
+        handler._now = lambda: frozen_now  # pylint: disable=protected-access
+
+        handler.add("478", "2h", dry_run=True)
+        dry_run_out = capsys.readouterr().out
+        dry_run_match = re.search(r"spentAt=(\S+?),", dry_run_out)
+        assert dry_run_match, f"no spentAt= found in dry-run output: {dry_run_out!r}"
+
+        mock_run.side_effect = [_global_id_response("issue"), _timelog_create_response()]
+        handler.add("478", "2h", dry_run=False)
+        create_cmd = mock_run.call_args_list[1][0][0]
+        real_spent_at = _variable_arg(create_cmd, "spentAt")
+
+        assert dry_run_match.group(1) == real_spent_at
+        # The clamp must actually have fired for this assertion to be meaningful —
+        # otherwise a dropped clamp on both sides would still agree with itself.
+        assert datetime.fromisoformat(real_spent_at) == frozen_now
+
+
+class TestAddMutationErrors:
+    """TimelogCreatePayload.errors is checked explicitly, beyond the top-level GraphQL
+    'errors' array — a populated errors array must never look like silent success."""
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_populated_payload_errors_raise_platform_error(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A 200 response whose payload carries a populated errors array (and a null timelog)
+        must raise, not return silently — the worst outcome for a command that records work
+        is a no-op that looks like success."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("issue"),
+            _timelog_create_response(errors=["Time spent is invalid"]),
+        ]
+        handler = _make_handler()
+
+        with pytest.raises(PlatformError, match="Time spent is invalid"):
+            handler.add("478", "not-a-real-duration", date_str="2026-08-05")
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_gitlab_rejected_duration_message_reaches_the_caller(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """GitLab's own duration-grammar rejection message is surfaced verbatim, not replaced
+        with a generic error — this handler never parses the duration grammar itself."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("issue"),
+            _timelog_create_response(errors=['"garbage-duration" is not a valid duration']),
+        ]
+        handler = _make_handler()
+
+        with pytest.raises(PlatformError, match="not a valid duration"):
+            handler.add("478", "garbage-duration", date_str="2026-08-05")
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_arbitrary_duration_string_is_passed_through_unparsed(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """The handler never validates or reformats the duration — whatever string is given
+        reaches the mutation call verbatim, letting GitLab be the sole authority on its
+        grammar (per the standing 'do not write a client-side duration parser' instruction)."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("issue"),
+            _timelog_create_response(),
+        ]
+        handler = _make_handler()
+
+        handler.add("478", "1h 30m", date_str="2026-08-05")
+
+        create_cmd = mock_run.call_args_list[1][0][0]
+        assert _variable_arg(create_cmd, "timeSpent") == "1h 30m"
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_duration_with_surrounding_whitespace_is_passed_through_verbatim(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A duration padded with whitespace reaches the mutation call byte-for-byte —
+        '1h 30m' alone (used above) cannot discriminate a hypothetical normalizing .strip()
+        from true pass-through, since stripping a value with no leading/trailing whitespace
+        is a no-op either way."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("issue"),
+            _timelog_create_response(),
+        ]
+        handler = _make_handler()
+
+        handler.add("478", "  1h 30m  ", date_str="2026-08-05")
+
+        create_cmd = mock_run.call_args_list[1][0][0]
+        assert _variable_arg(create_cmd, "timeSpent") == "  1h 30m  "
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_multiple_payload_errors_are_semicolon_joined_not_a_python_list_repr(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """Several payload errors render as a readable '; '-joined sentence, not a Python
+        list repr (['a', 'b']) — the latter is what the operator actually sees when GitLab
+        returns more than one validation message at once."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("issue"),
+            _timelog_create_response(errors=["Time spent is invalid", "Spent at is required"]),
+        ]
+        handler = _make_handler()
+
+        with pytest.raises(
+            PlatformError, match=r"Time spent is invalid; Spent at is required"
+        ) as exc_info:
+            handler.add("478", "garbage", date_str="2026-08-05")
+
+        assert "[" not in str(exc_info.value)
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_top_level_graphql_errors_during_resolution_propagate(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A top-level 'errors' array on the global-ID lookup raises, and the mutation is
+        never attempted."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [json.dumps({"errors": [{"message": "not found"}]})]
+        handler = _make_handler()
+
+        with pytest.raises(PlatformError, match="not found"):
+            handler.add("478", "2h", date_str="2026-08-05")
+
+        assert mock_run.call_count == 1
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_top_level_graphql_errors_during_creation_propagate(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A top-level 'errors' array on the mutation itself (distinct from a populated
+        TimelogCreatePayload.errors) also raises."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("issue"),
+            json.dumps({"errors": [{"message": "internal server error"}]}),
+        ]
+        handler = _make_handler()
+
+        with pytest.raises(PlatformError, match="internal server error"):
+            handler.add("478", "2h", date_str="2026-08-05")
+
+
+class TestAddTransportFailure:
+    """A PlatformError raised by run_glab_command itself (e.g. glab missing, auth failure) is
+    not swallowed at either write-path call site — the read path covers both of its own call
+    sites for this (TestResolveCurrentUser, TestPagination); the write path had neither."""
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_glab_failure_during_global_id_resolution_propagates(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = PlatformError("glab command not found. Please install glab CLI.")
+        handler = _make_handler()
+
+        with pytest.raises(PlatformError, match="glab command not found"):
+            handler.add("478", "2h", date_str="2026-08-05")
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_glab_failure_during_create_timelog_propagates(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("issue"),
+            PlatformError("glab auth failed"),
+        ]
+        handler = _make_handler()
+
+        with pytest.raises(PlatformError, match="glab auth failed"):
+            handler.add("478", "2h", date_str="2026-08-05")
+
+
+class TestAddSuccessRequiresTimelogId:
+    """A null or missing created timelog is reported as failure, not success — the
+    mutation's own 'timelog { id }' selection exists precisely to let this be checked.
+    Moving the '✓ Logged' print to run before _create_timelog() must fail every test in this
+    class, since none of them would then assert on the payload's timelog field at all."""
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            pytest.param(
+                {"data": {"timelogCreate": {"errors": [], "timelog": None}}},
+                id="errors_empty_timelog_null",
+            ),
+            pytest.param(
+                {"data": {"timelogCreate": None}},
+                id="timelog_create_null",
+            ),
+            pytest.param({"data": {}}, id="data_has_no_timelog_create_key"),
+            pytest.param({"data": None}, id="data_key_is_null"),
+        ],
+    )
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_null_or_missing_timelog_payload_raises_instead_of_printing_success(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock, capsys, response
+    ) -> None:
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [_global_id_response("issue"), json.dumps(response)]
+        handler = _make_handler()
+
+        with pytest.raises(PlatformError, match="indeterminate"):
+            handler.add("478", "2h", date_str="2026-08-05")
+
+        assert "✓ Logged" not in capsys.readouterr().out
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_indeterminate_outcome_message_advises_verifying_before_retrying(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A blind retry risks a double-log (timelogCreate has no idempotency key and the
+        read path never dedups) — the message must steer the operator to check first, not
+        merely report a generic failure."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("issue"),
+            json.dumps({"data": {"timelogCreate": {"errors": [], "timelog": None}}}),
+        ]
+        handler = _make_handler()
+
+        with pytest.raises(PlatformError, match=r"projctl timelog.*before retrying"):
+            handler.add("478", "2h", date_str="2026-08-05")
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_populated_timelog_id_logs_it_and_prints_success(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock, caplog, capsys
+    ) -> None:
+        """A response carrying a real timelog id is logged at debug level and still prints
+        the success line — exercises _timelog_create_response()'s timelog_id parameter,
+        which no caller previously passed a non-default value for."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("issue"),
+            _timelog_create_response(timelog_id="42"),
+        ]
+        handler = _make_handler()
+
+        with caplog.at_level("DEBUG"):
+            handler.add("478", "2h", date_str="2026-08-05")
+
+        assert "42" in caplog.text
+        assert "✓ Logged" in capsys.readouterr().out
+
+
+class TestAddSummaryField:
+    """TimelogCreateInput.summary is `String!` with no schema default, which makes it a
+    structurally required GraphQL input field — GitLab's document validator rejects the
+    mutation before any resolver runs if it is omitted, independent of whether
+    issuableId/timeSpent are otherwise valid. Verified against the live schema:
+
+        $ glab api graphql -f query='mutation { timelogCreate(input: {
+              issuableId: "gid://gitlab/Issue/0", timeSpent: "1m"
+          }) { errors timelog { id } } }'
+        {"errors":[{"message":"Argument 'summary' on InputObject 'TimelogCreateInput' is
+         required. Expected type String!", ...}]}
+
+    A mock that merely returns success proves nothing about whether GitLab's real
+    validator would have accepted the document — every assertion here inspects the
+    actual outgoing '-f' fields, not the mocked response.
+    """
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_create_timelog_call_always_sends_a_summary_field(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """The outgoing mutation must carry a 'summary' GraphQL variable field — an omitted
+        field is exactly the shape the live probe above shows GitLab rejecting outright."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("issue"),
+            _timelog_create_response(),
+        ]
+        handler = _make_handler()
+
+        handler.add("478", "2h", date_str="2026-08-05")
+
+        create_cmd = mock_run.call_args_list[1][0][0]
+        assert _adjacent_pair_present(create_cmd, ["-f", "summary="])
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_summary_value_is_always_the_empty_string(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """summary carries no text — sending "" satisfies the schema without adding a
+        feature the user explicitly declined (no --summary flag). This also guards
+        against a future change deriving it from the duration or target ref."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("issue"),
+            _timelog_create_response(),
+        ]
+        handler = _make_handler()
+
+        handler.add("478", "2h", date_str="2026-08-05")
+
+        create_cmd = mock_run.call_args_list[1][0][0]
+        assert _variable_arg(create_cmd, "summary") == ""
+
+
+class TestAddMalformedGlobalIdResponse:
+    """A malformed global-ID lookup response degrades to a clear, distinguishing
+    PlatformError, not a crash — the response already distinguishes a missing project
+    (data.project is None) from a missing issuable (data.project.<field> is None), so the
+    two get separate messages rather than one generic 'could not resolve'."""
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_missing_project_key_raises_platform_error_naming_the_project(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A response with no 'project' key at all raises a clear, project-scoped
+        PlatformError rather than an uncaught AttributeError from unwrapping the missing
+        nesting, and rather than the issuable-scoped message below — the response gives
+        enough information to tell the two apart."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [json.dumps({"data": {}})]
+        handler = _make_handler()
+
+        with pytest.raises(PlatformError, match=r"Project 'group/project' was not found"):
+            handler.add("478", "2h", date_str="2026-08-05")
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_null_issue_within_project_raises_platform_error_naming_the_issue(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A project that exists but has no matching issue (null 'issue' field) raises an
+        issue-scoped PlatformError rather than forwarding a None global ID into the
+        mutation, and rather than the project-not-found message above."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [json.dumps({"data": {"project": {"issue": None}}})]
+        handler = _make_handler()
+
+        with pytest.raises(PlatformError, match=r"Issue #478 was not found"):
+            handler.add("478", "2h", date_str="2026-08-05")
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_missing_project_key_raises_platform_error_for_a_merge_request(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """The project-not-found branch is exercised on the MR path too, not only the issue
+        path — the two share one implementation, but only the issue path had a test."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [json.dumps({"data": {}})]
+        handler = _make_handler()
+
+        with pytest.raises(PlatformError, match=r"Project 'group/project' was not found"):
+            handler.add("!235", "30m", date_str="2026-08-05")
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_null_merge_request_within_project_raises_platform_error_naming_the_mr(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A project that exists but has no matching merge request (null 'mergeRequest'
+        field) raises an MR-scoped PlatformError, mirroring the issue-branch coverage above
+        — the mergeRequest selection and message were previously exercised only via the
+        happy path, never on this failure branch."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [json.dumps({"data": {"project": {"mergeRequest": None}}})]
+        handler = _make_handler()
+
+        with pytest.raises(PlatformError, match=r"Merge request #235 was not found"):
+            handler.add("!235", "30m", date_str="2026-08-05")
+
+
+class TestAddDateDefault:
+    """--date omitted defaults to today, local time — and is always sent explicitly."""
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_omitted_date_defaults_to_today_local(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """With no date_str, spentAt is built from today's local date, not a fixed default."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("issue"),
+            _timelog_create_response(),
+        ]
+        handler = _make_handler()
+        expected_today = _FIXED_NOW.date().isoformat()
+
+        handler.add("478", "2h")
+
+        create_cmd = mock_run.call_args_list[1][0][0]
+        assert _variable_arg(create_cmd, "spentAt").startswith(f"{expected_today}T12:00:00")
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_omitted_date_still_sends_an_explicit_spent_at_field(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """spentAt's own schema description says GitLab defaults it to the current time when
+        omitted — but that default is UTC-based server time, which would reintroduce exactly
+        the local-vs-UTC day-boundary bug _local_bound() exists to prevent on the read side.
+        The write path must never rely on that default: a 'spentAt' field must always be
+        present on the call, with no date_str given, not just spentAt='' (an empty value
+        would silently defer to the server) and not the field being absent altogether."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("issue"),
+            _timelog_create_response(),
+        ]
+        handler = _make_handler()
+
+        handler.add("478", "2h")
+
+        create_cmd = mock_run.call_args_list[1][0][0]
+        spent_at_value = _variable_arg(create_cmd, "spentAt")
+        assert spent_at_value != ""
+
+
+# ---------------------------------------------------------------------------
+# future-spentAt clamp (GitLab rejects "Spent at can't be a future date and
+# time.") — observed failure, reproduced live: local noon on today is itself
+# in the future for any entry logged before local noon, which is this
+# operator's normal 09:00-17:00 morning-to-afternoon logging pattern.
+# ---------------------------------------------------------------------------
+
+
+class TestAddFutureSpentAtClamp:
+    """spentAt for *today* must never exceed the present; a *future* --date must be
+    rejected client-side rather than silently clamped to today (which would log the
+    entry to the wrong day) or sent to GitLab to be rejected there (a wasted round
+    trip after target resolution). A day strictly before today is never affected."""
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_omitted_date_before_local_noon_clamps_spent_at_to_now(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A call before local noon on today must not send a future spentAt — GitLab
+        rejects any spentAt later than the present, and an unclamped noon would fail
+        on every such call given this operator's actual logging hours."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [_global_id_response("issue"), _timelog_create_response()]
+        handler = _make_handler()
+        frozen_now = datetime(2026, 8, 13, 9, 41, 0, tzinfo=_FIXED_TZ)
+        handler._now = lambda: frozen_now  # pylint: disable=protected-access
+
+        handler.add("478", "2h")
+
+        create_cmd = mock_run.call_args_list[1][0][0]
+        sent = datetime.fromisoformat(_variable_arg(create_cmd, "spentAt"))
+        assert sent <= frozen_now
+        # The clamp must not have crossed a day boundary while pulling the
+        # instant backward from noon to "now" — both are within today.
+        assert sent.date() == frozen_now.date()
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_omitted_date_after_local_noon_uses_unclamped_noon(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A call after local noon on today is unaffected by the clamp — spentAt is
+        exactly local noon, proving min(noon, now) does not fire when it need not."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [_global_id_response("issue"), _timelog_create_response()]
+        handler = _make_handler()
+        frozen_now = datetime(2026, 8, 13, 15, 0, 0, tzinfo=_FIXED_TZ)
+        handler._now = lambda: frozen_now  # pylint: disable=protected-access
+
+        handler.add("478", "2h")
+
+        create_cmd = mock_run.call_args_list[1][0][0]
+        assert _variable_arg(create_cmd, "spentAt") == "2026-08-13T12:00:00+06:00"
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_past_date_uses_noon_regardless_of_current_time_of_day(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A --date strictly before today always sends local noon, even when 'now' is
+        itself in the early morning — min(noon, now) is a no-op for a day before today
+        since a past day's noon is chronologically earlier than any instant on a later
+        day, regardless of that instant's time-of-day."""
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [_global_id_response("issue"), _timelog_create_response()]
+        handler = _make_handler()
+        # 06:00 local on a later day — before noon in time-of-day terms, but the day
+        # itself (2026-08-13) is after the requested --date (2026-08-05), so a mutation
+        # that swapped min() for max() (picking whichever instant is later) would still
+        # incorrectly pick this "now" over noon on 2026-08-05, which this assertion
+        # catches.
+        handler._now = lambda: datetime(2026, 8, 13, 6, 0, 0, tzinfo=_FIXED_TZ)
+
+        handler.add("478", "2h", date_str="2026-08-05")
+
+        create_cmd = mock_run.call_args_list[1][0][0]
+        assert _variable_arg(create_cmd, "spentAt") == "2026-08-05T12:00:00+06:00"
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_future_date_is_rejected_before_any_api_call(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock
+    ) -> None:
+        """A --date later than today raises ValueError naming the requested date, and
+        neither the git-remote lookup nor any glab command runs — clamping a future
+        date to today would silently log to the wrong day, which is worse than a
+        loud, client-side failure."""
+        handler = _make_handler()
+        handler._now = lambda: datetime(  # pylint: disable=protected-access
+            2026, 8, 13, 12, 0, 0, tzinfo=_FIXED_TZ
+        )
+
+        with pytest.raises(ValueError, match="2026-08-14"):
+            handler.add("478", "2h", date_str="2026-08-14")
+
+        mock_repo_path.assert_not_called()
+        mock_run.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# write path -> read path round trip (the property that matters most)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteReadRoundTrip:
+    """A write with `--date D` must be found by a subsequent read for local day D — the
+    single most important property of this change. spentAt is built from local noon
+    specifically so this holds even at UTC offsets where a naive UTC-midnight choice
+    would misfile the entry into the adjacent day."""
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_negative_offset_write_is_found_under_the_same_local_day_on_read(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock, capsys
+    ) -> None:
+        """At UTC-11:00, a naive UTC-midnight spentAt for local day D would read back as
+        D-1 — local noon must round-trip to exactly D."""
+        negative_tz = timezone(timedelta(hours=-11))
+        handler = TimelogHandler(tz=negative_tz)
+        # "2026-08-05" must read as a past day here, not today, so the
+        # today-clamp added for the future-date fix does not interfere with
+        # this test's own concern (the noon-vs-midnight offset hazard).
+        handler._now = lambda: datetime(2026, 8, 20, 15, 0, 0, tzinfo=negative_tz)
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("issue", gid="gid://gitlab/Issue/999"),
+            _timelog_create_response(),
+        ]
+
+        handler.add("478", "2h", date_str="2026-08-05")
+
+        written_spent_at = self._captured_spent_at(mock_run)
+        gitlab_read_back = self._as_gitlab_utc_string(written_spent_at)
+
+        mock_run.reset_mock()
+        mock_run.side_effect = [
+            _current_user_response(),
+            _timelogs_response(
+                [_issue_node(iid=478, spent_at=gitlab_read_back)], has_next_page=False
+            ),
+        ]
+
+        handler.report("2026-08-05")
+
+        out = capsys.readouterr().out
+        assert "2026-08-05 —" in out
+        assert "2026-08-04" not in out
+        assert "2026-08-06" not in out
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_positive_extreme_offset_write_is_found_under_the_same_local_day_on_read(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock, capsys
+    ) -> None:
+        """At UTC+14:00 (the practical maximum, e.g. Line Islands), a naive local-end-of-day
+        spentAt for local day D would read back as D+1 — local noon must round-trip to D."""
+        positive_tz = timezone(timedelta(hours=14))
+        handler = TimelogHandler(tz=positive_tz)
+        # "2026-08-05" must read as a past day here, not today, so the
+        # today-clamp added for the future-date fix does not interfere with
+        # this test's own concern (the noon-vs-midnight offset hazard).
+        handler._now = lambda: datetime(2026, 8, 20, 15, 0, 0, tzinfo=positive_tz)
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("issue", gid="gid://gitlab/Issue/999"),
+            _timelog_create_response(),
+        ]
+
+        handler.add("478", "2h", date_str="2026-08-05")
+
+        written_spent_at = self._captured_spent_at(mock_run)
+        gitlab_read_back = self._as_gitlab_utc_string(written_spent_at)
+
+        mock_run.reset_mock()
+        mock_run.side_effect = [
+            _current_user_response(),
+            _timelogs_response(
+                [_issue_node(iid=478, spent_at=gitlab_read_back)], has_next_page=False
+            ),
+        ]
+
+        handler.report("2026-08-05")
+
+        out = capsys.readouterr().out
+        assert "2026-08-05 —" in out
+        assert "2026-08-04" not in out
+        assert "2026-08-06" not in out
+
+    @patch(_GIT_HELPERS_PATCH_PATH)
+    @patch(_PATCH_PATH)
+    def test_clamped_write_before_local_noon_is_found_under_the_same_local_day_on_read(
+        self, mock_run: MagicMock, mock_repo_path: MagicMock, capsys
+    ) -> None:
+        """A write clamped to 'now' (because it happens before local noon on today, per
+        TestAddFutureSpentAtClamp) must still round-trip to the correct local day on read.
+        Every other case in this class uses a --date safely in the past, where noon is always
+        unclamped — none of them can exercise the clamped branch's own round-trip at all."""
+        tz = timezone(timedelta(hours=-11))
+        handler = TimelogHandler(tz=tz)
+        frozen_now = datetime(2026, 8, 20, 3, 0, 0, tzinfo=tz)  # before local noon on "today"
+        handler._now = lambda: frozen_now  # pylint: disable=protected-access
+        mock_repo_path.return_value = "group/project"
+        mock_run.side_effect = [
+            _global_id_response("issue", gid="gid://gitlab/Issue/999"),
+            _timelog_create_response(),
+        ]
+
+        handler.add("478", "2h")  # --date omitted -> today = 2026-08-20
+
+        written_spent_at = self._captured_spent_at(mock_run)
+        # The clamp must actually have fired for this test to exercise anything
+        # different from the sibling, unclamped cases above.
+        assert datetime.fromisoformat(written_spent_at) == frozen_now
+        gitlab_read_back = self._as_gitlab_utc_string(written_spent_at)
+
+        mock_run.reset_mock()
+        mock_run.side_effect = [
+            _current_user_response(),
+            _timelogs_response(
+                [_issue_node(iid=478, spent_at=gitlab_read_back)], has_next_page=False
+            ),
+        ]
+
+        handler.report("2026-08-20")
+
+        out = capsys.readouterr().out
+        assert "2026-08-20 —" in out
+        assert "2026-08-19" not in out
+        assert "2026-08-21" not in out
+
+    @staticmethod
+    def _captured_spent_at(mock_run: MagicMock) -> str:
+        """Extract the spentAt value sent as a GraphQL variable in the create-timelog call."""
+        create_cmd = mock_run.call_args_list[1][0][0]
+        return _variable_arg(create_cmd, "spentAt")
+
+    @staticmethod
+    def _as_gitlab_utc_string(spent_at: str) -> str:
+        """Simulate GitLab normalizing a stored instant to UTC and returning it 'Z'-suffixed —
+        the exact shape every other fixture's spentAt uses in this module."""
+        as_utc = datetime.fromisoformat(spent_at).astimezone(timezone.utc)
+        return as_utc.isoformat().replace("+00:00", "Z")

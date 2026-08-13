@@ -1,12 +1,19 @@
-"""Read-only report of the current user's own GitLab timelogs."""
+"""Report and log the current user's own GitLab timelogs."""
 
 import json
 import logging
 from collections import defaultdict
-from datetime import date, datetime, time, timedelta, tzinfo
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..exceptions import PlatformError
+from ..utils.git_helpers import (
+    extract_host_from_url,
+    get_current_repo_path,
+    get_gitlab_base_url,
+    parse_issue_url,
+    parse_mr_url,
+)
 from ..utils.glab_runner import run_glab_command
 
 logger = logging.getLogger(__name__)
@@ -40,6 +47,73 @@ _TIMELOGS_QUERY = (
     "project { name fullPath } "
     "} } }"
 )
+
+# Resolves an issue/MR iid to the GraphQL global ID timelogCreate's
+# issuableId argument requires (gid://gitlab/Issue/123), scoped to one
+# project via variables — the same pattern loader.py's group-epic lookup
+# uses ($fullPath: ID!, $iid: String!), verified working there.
+_ISSUE_GLOBAL_ID_QUERY = (
+    "query($fullPath: ID!, $iid: String!) { "
+    "project(fullPath: $fullPath) { issue(iid: $iid) { id } } }"
+)
+_MR_GLOBAL_ID_QUERY = (
+    "query($fullPath: ID!, $iid: String!) { "
+    "project(fullPath: $fullPath) { mergeRequest(iid: $iid) { id } } }"
+)
+
+# All four inputs travel as typed variables, not string-interpolated literals —
+# matching report()'s own queries, so every user- and server-controlled value
+# in this handler (timeSpent, spentAt, the resolved issuableId) goes through
+# the same injection-safe path rather than the write path being the one
+# exception. IssuableID! was confirmed against GitLab's schema (a mutation
+# error surfaces on a bad type, e.g. "Variable $issuableId of type Boolean!
+# is invalid" — never on the correct one).
+_TIMELOG_CREATE_MUTATION = (
+    "mutation("
+    "$issuableId: IssuableID!, $timeSpent: String!, $spentAt: Time, $summary: String!"
+    ") { timelogCreate(input: { "
+    "issuableId: $issuableId, timeSpent: $timeSpent, spentAt: $spentAt, summary: $summary"
+    " }) { errors timelog { id } } }"
+)
+
+# TimelogCreateInput.summary is `String!` with no schema default, which makes
+# it a structurally required GraphQL input field even though the product
+# treats it as optional free text — a document omitting it is rejected before
+# any resolver runs ("Argument 'summary' ... is required"), regardless of
+# issuableId/timeSpent validity. Sending an empty string satisfies the schema
+# while carrying no text, matching what the web UI's "optional" summary field
+# does under the hood. The user explicitly declined a --summary flag; this
+# constant exists solely to satisfy the transport, and must never become
+# user-settable.
+_TIMELOG_SUMMARY = ""
+
+# github.com is GitHub's own domain and can never serve GitLab's API — the
+# one host this handler can rule out with certainty from the string alone,
+# with no config and no network probe (get_current_repo_path() accepts any
+# origin, GitHub included, since other callers such as note.py/wiki.py
+# legitimately need that). A self-hosted GitLab under an arbitrary domain,
+# or a GitHub Enterprise deployment under a different domain, cannot be
+# told apart from a genuine GitLab host this way; those are instead caught
+# by --hostname being passed to every real glab call in this module (see
+# _resolve_global_id/_create_timelog) — glab itself fails loudly against a
+# host it has no configured auth for, which is the correct outcome for an
+# unrecognized host, not something to pre-validate here.
+_GITHUB_HOST = "github.com"
+
+
+def _reject_known_non_gitlab_host(host: str) -> None:
+    """Raise if `host` is definitively not a GitLab host.
+
+    Raises:
+        PlatformError: If host is github.com (or a github.com subdomain).
+    """
+    normalized = host.lower().rstrip(".")
+    if normalized == _GITHUB_HOST or normalized.endswith(f".{_GITHUB_HOST}"):
+        raise PlatformError(
+            f"The current directory's git remote resolves to {host!r}, which is "
+            "GitHub, not GitLab — 'timelog add' needs a GitLab remote. Run from "
+            "inside a GitLab-remote repository, or pass a full GitLab issue/MR URL."
+        )
 
 
 def _format_duration(seconds: int) -> str:
@@ -105,11 +179,17 @@ def _project_short_name(identity: str) -> str:
     return identity.rsplit("/", 1)[-1]
 
 
-# pylint: disable=too-few-public-methods
-# TimelogHandler is intentionally a single-responsibility class with one public
-# entry point (report); the rest are private steps of that one operation.
 class TimelogHandler:
-    """Reports the current user's own GitLab timelogs over a local-calendar-day window."""
+    """Reports the current user's own GitLab timelogs, and logs new entries.
+
+    report() is deliberately config-free and project-scope-free — the
+    `timelogs` root field needs neither (see cmd_timelog). add() is a
+    mutating operation and, unlike report(), does need project scope: an
+    issue/MR iid only resolves to the GraphQL global ID timelogCreate
+    requires within one project, so add() falls back to the current
+    directory's git remote when the target reference is not a full URL
+    (matching NoteHandler / WikiHandler's precedent for the same problem).
+    """
 
     def __init__(self, tz: Optional[tzinfo] = None) -> None:
         """Initialize the handler.
@@ -140,18 +220,25 @@ class TimelogHandler:
         except ValueError as exc:
             raise ValueError(f"Invalid date {value!r}; expected YYYY-MM-DD") from exc
 
-    def _local_bound(self, day: date, end_of_day: bool) -> datetime:
-        """Return the local start- or end-of-day instant for `day`, offset-aware.
+    def _localize(self, naive: datetime) -> datetime:
+        """Attach this handler's local offset to a naive datetime.
 
         With no injected tz (the production path), `astimezone(None)` treats
         the naive value as already being in system-local time and simply
-        attaches that offset — the correct reading, resolved per-date so a
-        date on the far side of a DST transition still gets it right. With an
-        injected tz (the test seam), the naive value must instead be
+        attaches that offset — the correct reading, resolved per-instant so
+        a value on the far side of a DST transition still gets it right.
+        With an injected tz (the test seam), the naive value must instead be
         *localized* into that zone via `replace(tzinfo=...)`: `astimezone()`
         would first assume the naive value is system-local and then convert
-        it, shifting the window by (tz offset − system offset) whenever the
+        it, shifting the result by (tz offset − system offset) whenever the
         two differ — invisible only when they happen to coincide.
+        """
+        if self._tz is None:
+            return naive.astimezone(self._tz)
+        return naive.replace(tzinfo=self._tz)
+
+    def _local_bound(self, day: date, end_of_day: bool) -> datetime:
+        """Return the local start- or end-of-day instant for `day`, offset-aware.
 
         `endTime` is inclusive on the GitLab side ("equal to or before"), so
         the end bound is the last microsecond of the day rather than the
@@ -162,9 +249,59 @@ class TimelogHandler:
         the day; :59.999999 closes that gap at the same cost.
         """
         naive = datetime.combine(day, time(23, 59, 59, 999999) if end_of_day else time.min)
-        if self._tz is None:
-            return naive.astimezone(self._tz)
-        return naive.replace(tzinfo=self._tz)
+        return self._localize(naive)
+
+    def _local_noon(self, day: date) -> datetime:
+        """Return local noon for `day`, offset-aware — the write path's spentAt instant.
+
+        spentAt must round-trip through report()'s own local-day bucketing
+        (_bucket_by_local_day() -> _parse_spent_at().astimezone(self._tz).date()),
+        so this needs the same offset-attachment logic _local_bound() uses,
+        just at a different time of day. Local midnight would round-trip
+        correctly at a non-negative UTC offset but land on the *previous*
+        local day once read back at any negative one (e.g. a naive UTC
+        00:00 reads back as the prior day at UTC-05:00); local 23:59:59
+        has the mirror failure at positive offsets. Noon has +-12h of slack
+        on both sides, which covers every real UTC offset (-12:00..+14:00)
+        without crossing a day boundary in either direction.
+
+        For `day == today`, the caller (add()) may further clamp this value
+        down to `min(this, now)` — GitLab rejects any spentAt later than the
+        present, and local noon is itself in the future for any entry
+        logged before local noon on the current day. That clamp is applied
+        by the caller, not here, because it depends on `now` rather than on
+        `day` alone.
+        """
+        naive = datetime.combine(day, time(12, 0, 0))
+        return self._localize(naive)
+
+    def _now(self) -> datetime:
+        """Return the current instant in this handler's local tz, always aware.
+
+        Deliberately `datetime.now(timezone.utc).astimezone(self._tz)`, not
+        the shorter `datetime.now(self._tz)`: with no injected tz (the
+        production path, `self._tz is None`), `datetime.now(None)` returns
+        a *naive* datetime, while `_local_noon()`/`_local_bound()` (via
+        `_localize()`) always return an *aware* one, even when `self._tz is
+        None` — `_localize()`'s `naive.astimezone(None)` branch attaches the
+        system's tzinfo rather than leaving it unset. add() compares this
+        method's return value against `_local_noon()`'s directly via
+        `min()`; a naive/aware mismatch there raises `TypeError: can't
+        compare offset-naive and offset-aware datetimes`, which is exactly
+        what an earlier version of this method did on the very first real,
+        non-dry-run invocation. Going through `timezone.utc` first sidesteps
+        the naive/aware distinction entirely and works identically whether
+        `self._tz` is None (converts to system-local) or an injected tzinfo
+        (converts to that zone).
+
+        A test seam mirroring `tz` on __init__: production callers never
+        override it — there is no CLI flag or config key for it. Tests
+        monkeypatch the bound method directly on an instance
+        (`handler._now = lambda: <frozen instant>`) rather than mocking the
+        `datetime` name, since `datetime.now` is a method of a C-implemented
+        type and cannot be patched via `patch.object` on the class itself.
+        """
+        return datetime.now(timezone.utc).astimezone(self._tz)
 
     # ------------------------------------------------------------------
     # GraphQL transport
@@ -572,7 +709,11 @@ class TimelogHandler:
             PlatformError: If the authenticated user cannot be resolved, or the
                 GraphQL request fails.
         """
-        start = self._parse_date_arg(date_str) if date_str else datetime.now(self._tz).date()
+        # Routed through _now() rather than a direct datetime.now(self._tz) call
+        # so this class has one clock seam, not two — a second, unmonkeypatched
+        # clock source here would silently defeat the frozen-_now() convention
+        # every write-path test relies on, even though only .date() is taken.
+        start = self._parse_date_arg(date_str) if date_str else self._now().date()
         end = self._parse_date_arg(to_str) if to_str else start
         if end < start:
             raise ValueError(
@@ -586,3 +727,271 @@ class TimelogHandler:
         username = self._resolve_current_user()
         nodes, total_spent_time = self._fetch_timelogs(username, start_time, end_time)
         self._print_report(username, start_time, end_time, nodes, total_spent_time)
+
+    # ------------------------------------------------------------------
+    # Write path
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_target(ref: str) -> Tuple[str, Optional[str], Optional[str], str]:
+        """Classify a target reference and parse (kind, host, project_path, iid).
+
+        Accepts the same reference forms as NoteHandler: N / #N or an
+        issues/work_items URL for an issue; !N or a merge_requests URL for
+        an MR. A bare, unprefixed digit string is treated as an issue —
+        the same default every other projctl command uses (see
+        NoteHandler.add_issue_note).
+
+        host is populated only when ref is a full URL — a bare/prefixed
+        reference carries no host of its own, and the caller (add()) must
+        resolve one from the current directory's git remote, the same
+        source it already falls back to for project_path in that case.
+        Binding host and project_path from the same source — rather than
+        letting host default to whatever glab's ambient resolution picks —
+        is what stops a URL for one GitLab instance being sent against an
+        unrelated host, or a bare reference silently resolving against a
+        non-GitLab remote (see add()'s _reject_known_non_gitlab_host call).
+
+        Raises:
+            ValueError: If the reference cannot be parsed to a numeric iid.
+        """
+        is_mr = ref.startswith("!") or "/-/merge_requests/" in ref
+        project_path, iid = parse_mr_url(ref) if is_mr else parse_issue_url(ref)
+        # isdigit() alone admits non-ASCII digit characters (e.g. Arabic-indic
+        # or full-width digits, or superscripts like '²') that GitLab's own
+        # iid never is — isascii() narrows the guard to the characters an
+        # iid can actually contain.
+        if not iid or not iid.isascii() or not iid.isdigit():
+            raise ValueError(
+                f"Cannot parse target reference: {ref!r}; accepted forms are N, "
+                "#N, or a full issue URL for an issue, and !N or a full "
+                "merge-request URL for an MR"
+            )
+        host = extract_host_from_url(ref) if project_path else None
+        return ("mr" if is_mr else "issue"), host, project_path, iid
+
+    def _resolve_global_id(
+        self, kind: str, host: Optional[str], project_path: str, iid: str
+    ) -> str:
+        """Resolve an issue/MR iid to its GraphQL global ID within one project.
+
+        timelogCreate's issuableId argument is a GlobalID
+        (gid://gitlab/Issue/123 or gid://gitlab/MergeRequest/456), not the
+        iid used everywhere else in projctl — this project-scoped lookup is
+        the one extra round trip the write path needs that report() never
+        does, because report()'s root-level `timelogs` field needs no
+        project scope at all.
+
+        host, when known, travels as glab's own --hostname flag rather than
+        being left to glab's ambient host resolution (current directory's
+        git remote, or gitlab.com) — see add()'s docstring on why the
+        resolve call and the create call below must agree on host rather
+        than each resolving it independently.
+
+        Raises:
+            PlatformError: If the project/issue/MR cannot be found or the
+                API call fails.
+        """
+        # Named distinctly from _fetch_timelogs's local (report()'s own GraphQL
+        # step) purely to keep this cmd list's source text from line-matching
+        # loader.py's _fetch_epic_assignees closely enough to trip pylint's
+        # duplicate-code check — both build an "api graphql -f query=... -f"
+        # prefix, which is unavoidable idiom overlap, not real duplication.
+        resolve_query = _ISSUE_GLOBAL_ID_QUERY if kind == "issue" else _MR_GLOBAL_ID_QUERY
+        field = "issue" if kind == "issue" else "mergeRequest"
+        cmd = ["api", "graphql"]
+        if host:
+            cmd += ["--hostname", host]
+        cmd += [
+            "-f",
+            f"query={resolve_query}",
+            "-f",
+            f"fullPath={project_path}",
+            "-f",
+            f"iid={iid}",
+        ]
+        data = self._parse_graphql_response(run_glab_command(cmd))
+        project = data.get("project")
+        if project is None:
+            raise PlatformError(
+                f"Project {project_path!r} was not found, or you do not have "
+                "access to it — check the project path."
+            )
+        target = project.get(field)
+        global_id = (target or {}).get("id")
+        if not global_id:
+            label = "Issue" if kind == "issue" else "Merge request"
+            raise PlatformError(
+                f"{label} #{iid} was not found in project {project_path!r}, or "
+                "you do not have access to it — check the reference."
+            )
+        return str(global_id)
+
+    def _create_timelog(
+        self, host: Optional[str], issuable_gid: str, time_spent: str, spent_at: datetime
+    ) -> None:
+        """Execute the timelogCreate mutation.
+
+        summary is always sent as an empty string (_TIMELOG_SUMMARY) —
+        TimelogCreateInput.summary is `String!` with no schema default, so
+        GitLab's document validator rejects the mutation before any resolver
+        runs if it is omitted, independent of whether issuableId/timeSpent
+        are otherwise valid.
+
+        host, when known, travels as glab's own --hostname flag — see
+        _resolve_global_id's docstring; the resolve call and this call must
+        agree on host, since a disagreement would resolve the global ID on
+        one GitLab instance and attempt the write against another.
+
+        GitLab can return HTTP 200 with a populated
+        TimelogCreatePayload.errors array and a null timelog — a silently
+        no-op mutation would be the worst outcome for a command whose whole
+        purpose is recording work, so errors is checked explicitly here,
+        beyond the top-level GraphQL 'errors' array _parse_graphql_response()
+        already checks. A response with neither errors nor a created
+        timelog (the payload's `timelog { id }` selection exists precisely
+        to prove a write occurred) is checked too, and raised as a distinct,
+        indeterminate outcome: timelogCreate has no idempotency key and the
+        read path deliberately never dedups, so telling the operator to
+        retry blindly would risk a double-log.
+
+        Raises:
+            PlatformError: If the mutation reports errors, the response has
+                neither errors nor a created timelog, or the API call fails.
+        """
+        cmd = ["api", "graphql"]
+        if host:
+            cmd += ["--hostname", host]
+        cmd += [
+            "-f",
+            f"query={_TIMELOG_CREATE_MUTATION}",
+            "-f",
+            f"issuableId={issuable_gid}",
+            "-f",
+            f"timeSpent={time_spent}",
+            "-f",
+            f"spentAt={spent_at.isoformat()}",
+            "-f",
+            f"summary={_TIMELOG_SUMMARY}",
+        ]
+        data = self._parse_graphql_response(run_glab_command(cmd))
+        payload = data.get("timelogCreate") or {}
+        errors = payload.get("errors") or []
+        if errors:
+            raise PlatformError("GitLab rejected the timelog: " + "; ".join(str(e) for e in errors))
+        timelog_id = (payload.get("timelog") or {}).get("id")
+        if not timelog_id:
+            raise PlatformError(
+                "GitLab returned no error but also no created timelog — the "
+                "outcome is indeterminate. timelogCreate has no idempotency key "
+                "and the read path deliberately never dedups entries, so "
+                "retrying blindly risks a double-log. Verify with 'projctl "
+                "timelog' before retrying."
+            )
+        logger.debug("Timelog created: id=%s", timelog_id)
+
+    def add(
+        self,
+        target_ref: str,
+        duration: str,
+        date_str: Optional[str] = None,
+        dry_run: bool = False,
+    ) -> None:
+        """Log time against an issue or MR.
+
+        Args:
+            target_ref: Issue/MR reference: N, #N, !N, or a full URL.
+            duration: GitLab duration syntax (e.g. '2h', '30m', '1h 30m'),
+                passed through unparsed — GitLab validates it and rejects a
+                malformed value via _create_timelog's errors check; this
+                handler never parses the grammar itself.
+            date_str: Local calendar date the time was spent, YYYY-MM-DD;
+                defaults to today (local date). Must not be later than
+                today. Built into spentAt via _local_noon(), clamped to
+                `now` when date_str names today — see the clamp comment
+                below — so a later `timelog --date` report of the same day
+                finds this entry; see _local_noon's docstring.
+            dry_run: When True, resolve and print the intent, making no
+                glab API calls at all (matching updater.py's dry-run
+                convention) — not even the read-only global-ID lookup.
+
+        Raises:
+            ValueError: If the target reference or date cannot be parsed,
+                or date_str names a date later than today.
+            PlatformError: If project scope or host cannot be resolved (or
+                resolves to a known non-GitLab host), or any API call fails
+                or is rejected.
+        """
+        now = self._now()
+        today = now.date()
+        day = self._parse_date_arg(date_str) if date_str else today
+        if day > today:
+            # Rejected here rather than clamped to today or left for GitLab
+            # to reject: clamping would silently log the entry to the wrong
+            # day (today, not the day asked for) — a wrong answer, worse
+            # than a loud failure — and letting GitLab reject it would waste
+            # a target-resolution round trip on a request that can never
+            # succeed.
+            raise ValueError(
+                f"--date {day.isoformat()} is in the future; 'timelog add' only "
+                f"accepts today ({today.isoformat()}) or an earlier date"
+            )
+
+        # host and project_path are always resolved from the same source —
+        # both from the URL for a full-URL reference, both from the current
+        # directory's git remote for a bare/prefixed one — and never mixed.
+        # A resolve call and a create call disagreeing on host would let the
+        # global-ID lookup succeed against one GitLab instance while the
+        # mutation runs against another, on a path-only collision.
+        kind, host, project_path, iid = self._resolve_target(target_ref)
+        if project_path is None:
+            # Local-only (no API call): safe to run during dry-run too, and
+            # doing so lets the dry-run preview show the real project.
+            project_path = get_current_repo_path()
+            if not project_path:
+                raise PlatformError(
+                    "Cannot determine the project to log time against — run "
+                    "'projctl timelog add' from inside a git repository with a "
+                    "GitLab remote, or pass a full issue/MR URL instead of a "
+                    "bare reference."
+                )
+            base_url = get_gitlab_base_url()
+            host = extract_host_from_url(base_url) if base_url else None
+            if host:
+                _reject_known_non_gitlab_host(host)
+
+        # GitLab rejects a spentAt later than the present ("Spent at can't
+        # be a future date and time.") — local noon (see _local_noon's own
+        # WHY comment on the negative-UTC-offset hazard it guards against)
+        # is itself in the future for any entry logged before local noon on
+        # the current day, which is this operator's normal morning-logging
+        # pattern. min(noon, now) keeps the entry on *today's* local date by
+        # construction whenever it changes anything — now is always within
+        # today's local window by definition. Applied unconditionally
+        # rather than gated on `day == today`: the future-date check above
+        # already guarantees day <= today, so for any day strictly before
+        # today, local noon on that day is chronologically earlier than any
+        # instant on today and min() is a no-op — an explicit `day ==
+        # today` guard here would be redundant, not a correctness gap. Do
+        # not "simplify" this to a bare _local_noon(day) call: that drops
+        # the clamp for today entirely and reintroduces the observed
+        # failure this fix exists for.
+        spent_at = min(self._local_noon(day), now)
+
+        # "!" for an MR, "#" for an issue — matches the read path's own
+        # _target_label() sigil, so a write and a subsequent report never
+        # disagree on how the same target is denoted.
+        sigil = "!" if kind == "mr" else "#"
+
+        if dry_run:
+            host_display = host if host else "(glab default)"
+            print(
+                f"[dry-run] Would log {duration} to {kind} #{iid} in {project_path} "
+                f"on {host_display} (spentAt={spent_at.isoformat()}, "
+                f"local day {day.isoformat()})"
+            )
+            return
+
+        global_id = self._resolve_global_id(kind, host, project_path, iid)
+        self._create_timelog(host, global_id, duration, spent_at)
+        print(f"✓ Logged {duration} to {sigil}{iid} in {project_path} on {day.isoformat()}")

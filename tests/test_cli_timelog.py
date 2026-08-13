@@ -14,9 +14,24 @@ from projctl.exceptions import PlatformError
 
 def _args(**overrides) -> SimpleNamespace:
     """Build an args namespace with every field cmd_timelog reads."""
-    defaults = {"date": None, "to": None, "config": None}
+    defaults = {
+        "date": None,
+        "to": None,
+        "config": None,
+        "target": None,
+        "duration": None,
+        "log_date": None,
+        "dry_run": False,
+    }
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
+
+
+def _add_args(**overrides) -> SimpleNamespace:
+    """Build an args namespace shaped like a real 'timelog add TARGET DURATION' parse."""
+    defaults = {"date": "add", "target": "478", "duration": "2h"}
+    defaults.update(overrides)
+    return _args(**defaults)
 
 
 @pytest.fixture(name="handler_cls")
@@ -288,3 +303,268 @@ class TestArgparseWiring:
         assert "server-computed total (5h) differs from the sum of this report's rows (1h)" in (
             captured.err
         )
+
+
+class TestTimelogAddDispatch:
+    """cmd_timelog routes 'add' to the write path and forwards its fields unchanged."""
+
+    def test_add_forwards_target_duration_and_defaults(self, handler_cls: Mock) -> None:
+        """target/duration are forwarded; log_date defaults to None and dry_run to False."""
+        rc = cmd_timelog(_add_args())
+
+        assert rc == 0
+        handler_cls.assert_called_once_with()
+        handler_cls.return_value.add.assert_called_once_with("478", "2h", None, dry_run=False)
+
+    def test_add_forwards_log_date_and_dry_run(self, handler_cls: Mock) -> None:
+        """--date and --dry-run are forwarded as log_date and dry_run."""
+        rc = cmd_timelog(_add_args(log_date="2026-08-05", dry_run=True))
+
+        assert rc == 0
+        handler_cls.return_value.add.assert_called_once_with(
+            "478", "2h", "2026-08-05", dry_run=True
+        )
+
+    def test_add_does_not_call_report(self, handler_cls: Mock) -> None:
+        """The 'add' dispatch must never also call report() on the same handler instance."""
+        cmd_timelog(_add_args())
+
+        handler_cls.return_value.report.assert_not_called()
+
+
+class TestTimelogAddValidation:
+    """cmd_timelog rejects malformed 'add' invocations before constructing a handler."""
+
+    def test_missing_target_and_duration_returns_one(
+        self, handler_cls: Mock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """'timelog add' with neither TARGET nor DURATION is rejected, not silently accepted."""
+        with caplog.at_level("ERROR"):
+            rc = cmd_timelog(_add_args(target=None, duration=None))
+
+        assert rc == 1
+        handler_cls.assert_not_called()
+        assert "TARGET and DURATION" in caplog.text
+
+    def test_missing_duration_only_returns_one(
+        self, handler_cls: Mock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """'timelog add TARGET' with no DURATION is rejected."""
+        with caplog.at_level("ERROR"):
+            rc = cmd_timelog(_add_args(duration=None))
+
+        assert rc == 1
+        handler_cls.assert_not_called()
+
+    def test_empty_string_target_is_treated_as_missing(
+        self, handler_cls: Mock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An empty-string target (falsy) is rejected the same as an absent one."""
+        with caplog.at_level("ERROR"):
+            rc = cmd_timelog(_add_args(target=""))
+
+        assert rc == 1
+        handler_cls.assert_not_called()
+
+    def test_to_flag_with_add_is_rejected(
+        self, handler_cls: Mock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """--to belongs to the report form; combining it with 'add' is rejected, not ignored."""
+        with caplog.at_level("ERROR"):
+            rc = cmd_timelog(_add_args(to="2026-08-12"))
+
+        assert rc == 1
+        handler_cls.assert_not_called()
+        assert "--to" in caplog.text
+
+    def test_report_form_with_stray_extra_positional_is_rejected(
+        self, handler_cls: Mock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A stray extra positional after a real report date (not literally 'add') is rejected
+        rather than silently absorbed into the now-present target/duration positionals —
+        this preserves the pre-existing 'unrecognized arguments' strictness."""
+        with caplog.at_level("ERROR"):
+            rc = cmd_timelog(_args(date="2026-08-05", target="stray"))
+
+        assert rc == 1
+        handler_cls.assert_not_called()
+
+    def test_report_form_with_dry_run_flag_is_rejected(
+        self, handler_cls: Mock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """--dry-run belongs to 'add'; using it on the report form is rejected, not a silent
+        no-op — a silently-ignored flag would look like it did something."""
+        with caplog.at_level("ERROR"):
+            rc = cmd_timelog(_args(date="2026-08-05", dry_run=True))
+
+        assert rc == 1
+        handler_cls.assert_not_called()
+
+    def test_report_form_with_log_date_flag_is_rejected(
+        self, handler_cls: Mock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """--date belongs to 'add'; using it on the report form is rejected."""
+        with caplog.at_level("ERROR"):
+            rc = cmd_timelog(_args(date="2026-08-05", log_date="2026-08-06"))
+
+        assert rc == 1
+        handler_cls.assert_not_called()
+
+
+class TestTimelogAddPlatformGate:
+    """The GitHub platform rejection applies to 'add' exactly as it does to the report form."""
+
+    def test_github_platform_rejects_add_before_constructing_handler(self) -> None:
+        """A github platform config exits 1 for 'add' without ever building a handler."""
+        with patch("projctl.cli.Config") as mock_config_cls, patch(
+            "projctl.cli.TimelogHandler"
+        ) as mock_handler_cls:
+            mock_config_cls.return_value.platform = "github"
+
+            rc = cmd_timelog(_add_args())
+
+            assert rc == 1
+            mock_handler_cls.assert_not_called()
+
+
+class TestTimelogAddErrorHandling:
+    """Handler failures during 'add' become a non-zero exit code, not a traceback."""
+
+    def test_platform_error_from_add_returns_one(
+        self, handler_cls: Mock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A PlatformError from handler.add() (e.g. no GitLab remote) exits 1 and is logged."""
+        handler_cls.return_value.add.side_effect = PlatformError(
+            "Cannot determine the project to log time against"
+        )
+
+        with caplog.at_level("ERROR"):
+            rc = cmd_timelog(_add_args())
+
+        assert rc == 1
+        assert "Cannot determine the project" in caplog.text
+
+    def test_value_error_from_add_returns_one(
+        self, handler_cls: Mock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A ValueError from handler.add() (e.g. unparseable target ref) exits 1 and is logged."""
+        handler_cls.return_value.add.side_effect = ValueError("Cannot parse target reference")
+
+        with caplog.at_level("ERROR"):
+            rc = cmd_timelog(_add_args(target="garbage"))
+
+        assert rc == 1
+        assert "Cannot parse target reference" in caplog.text
+
+
+class TestTimelogAddAbsentConfigFallback:
+    """'timelog add' must also run with no config file present anywhere — it resolves project
+    scope from the git remote (see TimelogHandler.add()), not from config.get_default_group()."""
+
+    def test_no_config_anywhere_without_explicit_flag_still_runs(self) -> None:
+        """No config file found and no --config given: 'add' still runs."""
+        with patch(
+            "projctl.cli.Config",
+            side_effect=FileNotFoundError("No config file found."),
+        ), patch("projctl.cli.TimelogHandler") as mock_handler_cls:
+            rc = cmd_timelog(_add_args())
+
+        assert rc == 0
+        mock_handler_cls.return_value.add.assert_called_once_with("478", "2h", None, dry_run=False)
+
+    def test_explicit_missing_config_path_is_still_a_hard_error(self) -> None:
+        """An explicitly-named --config path that does not exist is never swallowed for 'add'
+        either — matches the report form's existing behaviour exactly."""
+        with patch(
+            "projctl.cli.Config",
+            side_effect=FileNotFoundError("Config file not found: /nonexistent/projctl.yaml"),
+        ), patch("projctl.cli.TimelogHandler") as mock_handler_cls:
+            rc = cmd_timelog(_add_args(config="/nonexistent/projctl.yaml"))
+
+        assert rc == 1
+        mock_handler_cls.assert_not_called()
+
+
+class TestTimelogAddArgparseWiring:
+    """Exercises the real parser built by _add_timelog_subparser() for the 'add' form."""
+
+    def test_real_parser_wires_add_target_duration_to_handler(self) -> None:
+        """'timelog add 478 2h' reaches handler.add() with the right positional values."""
+        with patch("projctl.cli.Config") as mock_config_cls, patch(
+            "projctl.cli.TimelogHandler"
+        ) as mock_handler_cls:
+            mock_config_cls.return_value.platform = "gitlab"
+
+            rc = main(["timelog", "add", "478", "2h"])
+
+        assert rc == 0
+        mock_handler_cls.return_value.add.assert_called_once_with("478", "2h", None, dry_run=False)
+
+    def test_real_parser_wires_add_date_and_dry_run_flags(self) -> None:
+        """'timelog add TARGET DURATION --date D --dry-run' reaches handler.add() with both
+        flags forwarded, proving the argparse dest names (log_date, dry_run) are wired
+        correctly — a dest mismatch here would be invisible to the hand-built SimpleNamespace
+        tests above."""
+        with patch("projctl.cli.Config") as mock_config_cls, patch(
+            "projctl.cli.TimelogHandler"
+        ) as mock_handler_cls:
+            mock_config_cls.return_value.platform = "gitlab"
+
+            rc = main(["timelog", "add", "!235", "1h 30m", "--date", "2026-08-05", "--dry-run"])
+
+        assert rc == 0
+        mock_handler_cls.return_value.add.assert_called_once_with(
+            "!235", "1h 30m", "2026-08-05", dry_run=True
+        )
+
+    def test_real_parser_still_wires_bare_report_form_after_add_was_registered(self) -> None:
+        """Adding the target/duration positionals must not disturb the pre-existing report
+        form's argparse wiring — this is the exact scenario the read-path baseline
+        (1002 passed) depends on staying green."""
+        with patch("projctl.cli.Config") as mock_config_cls, patch(
+            "projctl.cli.TimelogHandler"
+        ) as mock_handler_cls:
+            mock_config_cls.return_value.platform = "gitlab"
+
+            rc = main(["timelog", "2026-08-05", "--to", "2026-08-12"])
+
+        assert rc == 0
+        mock_handler_cls.return_value.report.assert_called_once_with("2026-08-05", "2026-08-12")
+        mock_handler_cls.return_value.add.assert_not_called()
+
+    def test_real_handler_end_to_end_add_with_no_injected_tz(self, capsys) -> None:
+        """argv -> main() -> cmd_timelog -> a real TimelogHandler(tz=None) -> add(), with
+        only the glab transport mocked.
+
+        Every add() test in test_timelog.py injects tz=_FIXED_TZ and monkeypatches
+        handler._now directly, so none of them exercise the tz=None production composition
+        where comparing an aware _local_noon() value against a naive datetime.now(None) once
+        raised 'TypeError: can't compare offset-naive and offset-aware datetimes' on the
+        first real, non-dry-run invocation — TestNow verifies _now() in isolation against
+        that regression, never this end-to-end wiring. A full URL target sidesteps the
+        git-remote lookup so the test does not depend on this repository's own git remote,
+        which a bare-reference call would otherwise resolve for real.
+        """
+        global_id_response = json.dumps(
+            {"data": {"project": {"issue": {"id": "gid://gitlab/Issue/999"}}}}
+        )
+        create_response = json.dumps(
+            {"data": {"timelogCreate": {"errors": [], "timelog": {"id": "1"}}}}
+        )
+
+        with patch("projctl.cli.Config") as mock_config_cls:
+            mock_config_cls.return_value.platform = "gitlab"
+            with patch("projctl.handlers.timelog.run_glab_command") as mock_run:
+                mock_run.side_effect = [global_id_response, create_response]
+                rc = main(
+                    [
+                        "timelog",
+                        "add",
+                        "https://gitlab.example.com/group/project/-/issues/478",
+                        "2h",
+                    ]
+                )
+
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "Logged 2h to #478 in group/project" in captured.out

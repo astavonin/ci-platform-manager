@@ -39,7 +39,7 @@ projctl/
 │   ├── search.py        # Search operations
 │   ├── comment.py       # Post MR comments
 │   ├── mr_handler.py    # Create merge requests
-│   └── timelog.py       # Report own logged time
+│   └── timelog.py       # Report and log own time
 ├── utils/               # Shared utilities
 │   ├── config_migration.py
 │   ├── git_helpers.py
@@ -498,21 +498,26 @@ projctl create-mr --dry-run
 
 ### Timelog
 
-Report your own logged time for a date or an inclusive date range. Read-only. GitLab only.
+Report your own logged time for a date or an inclusive date range, or log new time against an issue or MR. GitLab only.
 
 ```bash
 projctl timelog                                  # today
 projctl timelog 2026-08-05                       # that day
 projctl timelog 2026-08-05 --to 2026-08-12       # inclusive interval
+
+projctl timelog add 478 2h                        # log 2h to issue #478, today
+projctl timelog add "!235" 30m --date 2026-08-05 --dry-run
 ```
 
-The date window is local calendar days (built from the machine's system timezone, no config key or flag), never deduplicates entries, and hard-errors if the authenticated GitLab user cannot be resolved rather than silently reporting an empty result. Rows gain a project-name prefix once the queried window spans multiple projects, and an entry with neither an issue nor an MR attached renders as `(no issue/MR) <project>` rather than being dropped.
+The report date window is local calendar days (built from the machine's system timezone, no config key or flag), never deduplicates entries, and hard-errors if the authenticated GitLab user cannot be resolved rather than silently reporting an empty result. Rows gain a project-name prefix once the queried window spans multiple projects, and an entry with neither an issue nor an MR attached renders as `(no issue/MR) <project>` rather than being dropped.
 
 Pagination follows `pageInfo.hasNextPage`/`endCursor` and is capped at 200 pages (20,000 entries). Three shapes are hard errors rather than a silently truncated report: `hasNextPage=true` with no usable cursor to continue from, a page repeating a cursor already seen this call, and exceeding the 200-page cap — each names the likely cause and suggests narrowing the date window.
 
 The printed grand total is always the sum of the report's own rows, never the server's. GitLab's server-computed `totalSpentTime` (from the first page where it is present) is used only as a cross-check, logged as a warning on disagreement — which can happen legitimately, since GitLab computes it *before* authorization filtering ([gitlab-org/gitlab#425747](https://gitlab.com/gitlab-org/gitlab/-/issues/425747)).
 
-`timelog` runs with no config file present anywhere; commands that construct `Config` hard-fail on its `FileNotFoundError`, and `timelog` never does — it needs no `default_group` or project scope, is GitLab-only by nature, and has its own `currentUser` host guard.
+`timelog add` accepts `478`/`#478`/a URL for an issue and `!235`/a URL for an MR, and passes `<DURATION>` through to GitLab unparsed (`2h`, `30m`, `1h 30m`) rather than validating its grammar client-side. `--date` is the local calendar date the time was spent; `spentAt` is normally built at local noon on that date, not local midnight, so a write and a subsequent report agree on which local day the entry belongs to at any UTC offset — except for today, where noon can itself be in the future (any entry logged before local noon), so `spentAt` is clamped to `min(local noon, now)` whenever that would otherwise happen. A `--date` later than today is rejected client-side before any API call, not silently clamped or left for GitLab to reject. `--dry-run` makes zero API calls. Unlike the report form, `add` needs project scope *and* a target host to resolve an issue/MR to its GraphQL global ID and log time on the right GitLab instance: a full URL carries both its own project and host; a bare/prefixed reference takes both from the current directory's git remote, and fails loudly if there is no git remote at all, or if the remote resolves to a known non-GitLab host (`github.com`). The resolved host travels explicitly on every GraphQL call via `glab`'s `--hostname` flag, so the global-ID lookup and the mutation cannot silently disagree on which instance they target.
+
+`timelog` (both forms) runs with no config file present anywhere. `cmd_timelog` is the only command that constructs `Config` and tolerates its `FileNotFoundError` — every *other* command that needs `Config` hard-fails on that same exception (`cmd_wiki` and `cmd_comment` are not counterexamples either way: neither constructs a `Config` at all). Report needs no `default_group` or project scope; `add` resolves project scope from the git remote instead, and both forms are GitLab-only by nature with their own host guards (`currentUser` null check for report; the git-remote host check described above for `add`).
 
 **Handler:** `handlers/timelog.py` — `TimelogHandler` class
 

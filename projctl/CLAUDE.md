@@ -41,7 +41,7 @@ projctl/
 │   ├── pipeline_handler.py    # Debug failed pipeline jobs (GitLab)
 │   ├── search.py              # Search operations (GitLab)
 │   ├── sync.py                # Planning folder sync (Google Drive)
-│   ├── timelog.py             # Report own logged time (GitLab)
+│   ├── timelog.py             # Report and log own time (GitLab)
 │   ├── updater.py             # Update issues/MRs/epics/milestones (GitLab)
 │   └── wiki.py                # Manage GitLab project wiki pages
 ├── utils/                     # Shared utilities
@@ -499,17 +499,23 @@ Reference formats accepted per resource type:
 
 ### Timelog
 
-Report your own logged time for a date or an inclusive date range. Read-only — never creates or modifies a timelog. GitLab only.
+Report your own logged time for a date or an inclusive date range, or log new time against an issue or MR. GitLab only.
 
 ```bash
+# Report (read-only)
 projctl timelog                                  # today
 projctl timelog 2026-08-05                       # that day
 projctl timelog 2026-08-05 --to 2026-08-12       # inclusive interval
+
+# Log time (write)
+projctl timelog add 478 2h                        # today, issue #478
+projctl timelog add "#478" "1h 30m" --date 2026-08-05
+projctl timelog add "!235" 30m --dry-run          # MR !235, preview only
 ```
 
-Output is a per-day total, a per-issue (or per-MR) breakdown within each day, and a grand total across the window — always preceded by the exact window queried and the GitLab identity queried as, even when the result is empty. A zero result is reported as "no timelogs returned for this window", never as a confident "you logged nothing", because an empty result caused by `glab` resolving the wrong host would look identical otherwise.
+Report output is a per-day total, a per-issue (or per-MR) breakdown within each day, and a grand total across the window — always preceded by the exact window queried and the GitLab identity queried as, even when the result is empty. A zero result is reported as "no timelogs returned for this window", never as a confident "you logged nothing", because an empty result caused by `glab` resolving the wrong host would look identical otherwise.
 
-**Behavior notes:**
+**Behavior notes — report:**
 - The date window is **local calendar days**, built from the machine's system timezone — not UTC days. There is no config key or flag for the offset; output is machine-dependent by design.
 - Before querying timelogs, the handler resolves the authenticated user via GraphQL `currentUser`. A `null` result is a **hard error** naming the likely cause (`glab` resolved to a host with no GitLab remote in the current directory), not an empty report — this is the command's main safety property, since a misdirected query would otherwise look exactly like "nothing logged".
 - Entries are **never deduplicated**: two timelogs with identical timestamp and duration on the same issue in the same day are both counted, since GitLab's own data contains exactly that shape.
@@ -518,8 +524,16 @@ Output is a per-day total, a per-issue (or per-MR) breakdown within each day, an
 - Rows gain a project-name prefix (e.g. `alpha #11 Fix bug`) once the **queried window** — not the individual day — spans more than one project; a single-project window renders with no prefix, unchanged from before this behavior existed. Two projects whose short names collide (e.g. `team-a/docs` and `team-b/docs` both ending in `docs`) fall back to their full path as the prefix instead of rendering identical, indistinguishable rows.
 - Results are paginated via `pageInfo.hasNextPage`/`endCursor`, never bounded on the connection's `count` field, which GitLab's own schema documents as saturating at "limit + 1" once the filtered set exceeds the page size. Pagination is capped at 200 pages (20,000 entries) — a legitimately reachable window, not just a safety margin. A page reporting `hasNextPage=true` with no usable cursor to continue from, a page repeating a cursor already seen this call, or exceeding the 200-page cap are all hard errors rather than a silently truncated report at exit code 0; each names the likely cause and suggests narrowing the date window.
 - The printed grand total is always the sum of the report's own rows, never the server's. GitLab's server-computed `totalSpentTime` — read once, from the first page where the key is present — is used only as a cross-check, logged as a warning when it disagrees and skipped when absent or unparsable. Disagreement can be legitimate: GitLab computes `totalSpentTime` *before* authorization filtering ([gitlab-org/gitlab#425747](https://gitlab.com/gitlab-org/gitlab/-/issues/425747)), so a user who can no longer see every timelog they logged (e.g. after losing access to an issue) will see a server total that includes entries their own rows can't.
-- `timelog` runs with **no config file present anywhere** — every command that constructs `Config` hard-fails on its `FileNotFoundError`, and `timelog` never does (it needs no `default_group` or project scope to resolve, is GitLab-only by nature, and has its own host guard — the `currentUser` null check above). An absent config only skips the fast platform-gate rejection; an explicitly-named `--config` path that does not exist is still a hard error.
-- No `--dry-run` flag — the command is read-only, matching the convention used by `load`, `search`, and `sync status`.
+- No `--dry-run` flag on the report form — it is read-only, matching the convention used by `load`, `search`, and `sync status`.
+
+**Behavior notes — add:**
+- `<TARGET>` accepts the same reference forms as `note`: `478`/`#478` or a full URL for an issue, `!235` or a full URL for an MR.
+- `<DURATION>` is GitLab's own duration syntax (`2h`, `30m`, `1h 30m`) passed through **unparsed** — this command never implements the grammar itself. A malformed duration is rejected by GitLab, and its message is surfaced verbatim via a `PlatformError`.
+- `--date` is the **local calendar date** the time was spent, defaulting to today. `spentAt` is normally built at **local noon** on that date (not local midnight) so it round-trips correctly through the report form's local-day bucketing at any UTC offset — a naive UTC-midnight timestamp would misfile the entry into the adjacent local day at some offsets. For `--date` defaulting to *today*, noon can itself be in the future relative to the actual call time (any entry logged before local noon) — GitLab rejects a future `spentAt` outright, so `spentAt` is clamped to `min(local noon, now)` whenever that would otherwise happen; the clamp is a no-op for any date strictly before today. A `--date` later than today is rejected client-side with a `ValueError`, before any project/target resolution or API call — not silently clamped to today, and not left for GitLab to reject.
+- Resolving `<TARGET>` to the GraphQL global ID `timelogCreate` needs **project scope and a target host**, neither of which the report form needs. A full issue/MR URL carries its own project path and host; a bare/prefixed reference falls back to the current directory's git remote for both (matching `note`/`wiki`), and fails with an actionable message if there is no git remote at all, or if the remote resolves to a known non-GitLab host (`github.com`) — it does **not** silently fall back to a default host. The resolved host travels explicitly on every `glab api graphql` call via `--hostname`, so the global-ID lookup and the mutation always agree on which GitLab instance they target.
+- The mutation checks `TimelogCreatePayload.errors` explicitly, beyond the top-level GraphQL `errors` array, and also requires a non-null `timelog.id` in the response when `errors` is empty — GitLab can return HTTP 200 with populated `errors` and a null payload, *or* with no `errors` and no created `timelog` at all, and either shape would otherwise print success for a write that never happened. The second case is reported as an indeterminate outcome (verify with `projctl timelog` before retrying) rather than a plain failure, since `timelogCreate` has no idempotency key and the read path never dedups.
+- `--dry-run` issues **zero** `glab` API calls — including the read-only global-ID lookup — while still running the local-only host/project resolution (and its `github.com` rejection), so the preview reflects the same target, project, host, and `spentAt` a real run would use.
+- `timelog` (both forms) runs with **no config file present anywhere**. `cmd_timelog` is the only command that constructs `Config` and tolerates a missing one — every *other* command that needs `Config` hard-fails on that same `FileNotFoundError`; `cmd_wiki` and `cmd_comment` are not counterexamples either way, since neither constructs a `Config` at all. Report needs no `default_group` or project scope at all; add resolves project scope from the git remote instead of from config. An absent config only skips the fast platform-gate rejection; an explicitly-named `--config` path that does not exist is still a hard error.
 
 **Handler:** `handlers/timelog.py` — `TimelogHandler` class
 

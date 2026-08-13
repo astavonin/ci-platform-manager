@@ -1122,16 +1122,32 @@ def cmd_note(args) -> int:
 
 
 def _add_timelog_subparser(subparsers: argparse._SubParsersAction) -> None:
-    """Register the 'timelog' subcommand."""
+    """Register the 'timelog' subcommand: report (default) plus the 'add' write form."""
     p = subparsers.add_parser(
         "timelog",
-        help="Report your own logged time for a date or date range (GitLab only)",
+        help="Report your own logged time, or log a new entry (GitLab only)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   timelog
   timelog 2026-08-05
   timelog 2026-08-05 --to 2026-08-12
+  timelog add 478 2h
+  timelog add "#478" "1h 30m" --date 2026-08-05
+  timelog add "!235" 30m --dry-run
+
+Quoting: quote a '#'- or '!'-prefixed TARGET as shown above — unquoted,
+'#' truncates the command at a shell comment (bash/zsh) and '!' triggers
+history expansion (interactive bash/zsh). A bare 478 needs no quoting.
+
+Flag placement: --date and --dry-run must appear before TARGET, or after
+both TARGET and DURATION — 'add TARGET --dry-run DURATION' is rejected by
+argparse as an unrecognized trailing argument, naming DURATION as the
+problem rather than the flag's position.
+
+Negative durations (GitLab '/spend -Nd' corrections) need a '--' separator
+before DURATION, e.g. 'timelog add 478 -- -30m' — a leading '-' otherwise
+looks like an unrecognized flag to argparse.
         """,
     )
     p.add_argument(
@@ -1139,21 +1155,73 @@ Examples:
         type=str,
         nargs="?",
         default=None,
-        help="Date to report, YYYY-MM-DD (default: today, local time)",
+        metavar="DATE",
+        help=(
+            "Date to report, YYYY-MM-DD (default: today, local time); "
+            "or the literal 'add' to log time (see TARGET/DURATION below)"
+        ),
+    )
+    p.add_argument(
+        "target",
+        type=str,
+        nargs="?",
+        default=None,
+        metavar="TARGET",
+        help="'timelog add' only: issue/MR to log time against — N/#N (issue), !N (MR), or a URL",
+    )
+    p.add_argument(
+        "duration",
+        type=str,
+        nargs="?",
+        default=None,
+        metavar="DURATION",
+        help="'timelog add' only: GitLab duration syntax, e.g. '2h', '30m', '1h 30m'",
     )
     p.add_argument(
         "--to",
         type=str,
         default=None,
         metavar="YYYY-MM-DD",
-        help="End date for an inclusive range (default: same as 'date')",
+        help="Report form only: end date for an inclusive range (default: same as 'date')",
+    )
+    p.add_argument(
+        "--date",
+        dest="log_date",
+        type=str,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="'timelog add' only: local date the time was spent (default: today)",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="'timelog add' only: preview without posting, zero API calls",
     )
 
 
-def cmd_timelog(args) -> int:
-    """Handle the 'timelog' subcommand.
+def _cmd_timelog_add(args) -> int:
+    """Handle 'timelog add TARGET DURATION [--date D] [--dry-run]'.
 
-    Read-only, so unlike the mutating commands this has no --dry-run flag.
+    Args:
+        args: Parsed command-line arguments (see _add_timelog_subparser).
+
+    Returns:
+        Exit code (0 for success, 1 for error).
+    """
+    if args.to is not None:
+        logger.error("--to is not valid with 'timelog add'")
+        return 1
+    if not args.target or not args.duration:
+        logger.error("timelog add requires TARGET and DURATION, e.g.: projctl timelog add 478 2h")
+        return 1
+
+    handler = TimelogHandler()
+    handler.add(args.target, args.duration, args.log_date, dry_run=args.dry_run)
+    return 0
+
+
+def cmd_timelog(args) -> int:
+    """Handle the 'timelog' subcommand: report (default), or 'timelog add' to log time.
 
     Args:
         args: Parsed command-line arguments.
@@ -1172,20 +1240,42 @@ def cmd_timelog(args) -> int:
                 # still a hard error — only the auto-search case below is
                 # forgiving.
                 raise
-            # timelog needs no config at all (TimelogHandler takes none — no
-            # default_group or project scope to resolve), and it is GitLab-only
-            # by nature. The platform gate below exists purely as a fast,
-            # friendly rejection; when no config file exists anywhere in the
-            # search order, there is nothing to gate on, and the GraphQL
-            # currentUser host guard inside TimelogHandler.report() already
-            # fails loudly on a non-GitLab host. Treating "no config found" as
-            # a hard error here made the command unusable in every directory
-            # that has no user-wide config file — including every GitLab repo
-            # without a local projctl.yaml.
+            # Neither form needs a config file to exist. report() needs no
+            # default_group or project scope to resolve, and is GitLab-only
+            # by nature; add() resolves project scope from the git remote
+            # instead of config (see TimelogHandler.add()). The platform
+            # gate below exists purely as a fast, friendly rejection; when
+            # no config file exists anywhere in the search order, there is
+            # nothing to gate on, and each form has its own host guard
+            # (report()'s currentUser null check; add()'s git-remote check).
+            # Treating "no config found" as a hard error here made the
+            # command unusable in every directory with no user-wide config
+            # file — including every GitLab repo without a local projctl.yaml.
             config = None
 
         if config is not None and config.platform != "gitlab":
             logger.error("Error: 'timelog' command is only supported for GitLab")
+            return 1
+
+        # "add" is not a valid YYYY-MM-DD date, so it can't collide with a
+        # real report date — reusing the existing DATE positional as the
+        # dispatch sentinel (rather than a dedicated subcommand) is what
+        # lets a single 'timelog' subparser serve both forms without a
+        # nested sub-subparser.
+        if args.date == "add":
+            return _cmd_timelog_add(args)
+
+        if args.target is not None or args.duration is not None:
+            # argparse's left-to-right nargs='?' filling for date/target/
+            # duration always populates target before duration, so duration
+            # can never be the sole extra value when date != "add" — the
+            # else arm is defensive against a future parser change, not
+            # reachable today.
+            extra = args.target if args.target is not None else args.duration
+            logger.error("Unrecognized extra argument for 'timelog': %r", extra)
+            return 1
+        if args.log_date is not None or args.dry_run:
+            logger.error("--date and --dry-run are only valid with 'timelog add'")
             return 1
 
         handler = TimelogHandler()
@@ -1408,6 +1498,7 @@ Examples:
   %(prog)s note issue 340 --body "Closing as false-positive."
   %(prog)s note epic &70 --body "Closed: different approach."
   %(prog)s timelog 2026-08-05 --to 2026-08-12
+  %(prog)s timelog add 478 2h
   %(prog)s pipeline-debug
   %(prog)s artifacts --job-id 12345 --path .build-12345/server.stdout
   %(prog)s config

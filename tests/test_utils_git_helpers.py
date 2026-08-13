@@ -4,9 +4,94 @@ import subprocess
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-import pytest
+from projctl.utils.git_helpers import extract_host_from_url, get_current_repo_path, parse_mr_url
 
-from projctl.utils.git_helpers import get_current_repo_path
+
+class TestExtractHostFromUrl:
+    """Test extract_host_from_url function — the symmetric counterpart to
+    extract_path_from_url, used by timelog.py's write path to bind a URL reference's own
+    host alongside its project path (see projctl/handlers/timelog.py::_resolve_target)."""
+
+    def test_https_url_returns_the_host(self) -> None:
+        """A standard https URL's host is extracted without its scheme or path."""
+        assert extract_host_from_url("https://gitlab.example.com/group/project") == (
+            "gitlab.example.com"
+        )
+
+    def test_url_with_path_after_host_returns_only_the_host(self) -> None:
+        """A deep path after the host does not leak into the returned host string."""
+        result = extract_host_from_url("https://gitlab.example.com/group/project/-/issues/478")
+        assert result == "gitlab.example.com"
+
+    def test_no_scheme_separator_returns_empty_string(self) -> None:
+        """A string with no '//' scheme separator (not a URL at all) returns ''."""
+        assert extract_host_from_url("group/project") == ""
+
+    def test_empty_string_returns_empty_string(self) -> None:
+        assert extract_host_from_url("") == ""
+
+
+class TestParseMrUrl:
+    """Test parse_mr_url function.
+
+    Scope note: this class tests git_helpers.parse_mr_url() only, which is the timelog
+    write path's canonical MR-reference parser (see that function's own docstring). It does
+    not describe how note.py, updater.py, or loader.py parse MR references — those three
+    modules each implement their own inline logic and diverge from this one (and each other)
+    on a URL fragment such as '#note_456'.
+    """
+
+    def test_plain_number(self) -> None:
+        """A bare digit string parses with no project path."""
+        assert parse_mr_url("134") == (None, "134")
+
+    def test_bang_prefixed(self) -> None:
+        """A '!'-prefixed reference strips the prefix, with no project path."""
+        assert parse_mr_url("!134") == (None, "134")
+
+    def test_full_url(self) -> None:
+        """A full MR URL extracts both the project path and the iid."""
+        result = parse_mr_url("https://gitlab.example.com/group/project/-/merge_requests/134")
+        assert result == ("group/project", "134")
+
+    def test_full_url_nested_group(self) -> None:
+        """A URL with a nested group path extracts the full path, not just the last segment."""
+        result = parse_mr_url("https://gitlab.example.com/org/team/project/-/merge_requests/9")
+        assert result == ("org/team/project", "9")
+
+    def test_url_with_trailing_slash_segment(self) -> None:
+        """A trailing path segment after the iid (e.g. /diffs) is stripped."""
+        result = parse_mr_url("https://gitlab.example.com/group/project/-/merge_requests/134/diffs")
+        assert result == ("group/project", "134")
+
+    def test_url_with_query_string(self) -> None:
+        """A trailing query string after the iid is stripped."""
+        result = parse_mr_url(
+            "https://gitlab.example.com/group/project/-/merge_requests/134?tab=commits"
+        )
+        assert result == ("group/project", "134")
+
+    def test_url_with_fragment(self) -> None:
+        """A trailing '#note_NNN' fragment after the iid is stripped."""
+        result = parse_mr_url(
+            "https://gitlab.example.com/group/project/-/merge_requests/134#note_456"
+        )
+        assert result == ("group/project", "134")
+
+    def test_unrecognized_format_returns_none_none(self) -> None:
+        """A reference matching none of the three formats returns (None, None)."""
+        assert parse_mr_url("not-a-valid-ref") == (None, None)
+
+    def test_empty_string_returns_none_none(self) -> None:
+        """An empty string is not a digit and not '!'-prefixed — returns (None, None)."""
+        assert parse_mr_url("") == (None, None)
+
+    def test_issue_style_url_is_not_matched(self) -> None:
+        """An issues URL (not merge_requests) does not match the MR URL branch."""
+        result = parse_mr_url("https://gitlab.example.com/group/project/-/issues/134")
+        # No '/-/merge_requests/' substring; falls through to the bare-digit
+        # check, which also fails since the whole URL string isn't a digit.
+        assert result == (None, None)
 
 
 class TestGetCurrentRepoPath:
