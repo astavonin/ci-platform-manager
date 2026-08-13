@@ -19,6 +19,7 @@ except ImportError:
 
 from .config import Config, config_search_paths
 from .exceptions import PlatformError
+from .handlers.activity import ActivityHandler
 from .handlers.artifacts_handler import ArtifactsHandler
 from .handlers.comment import cmd_comment
 from .handlers.labels import LabelsHandler
@@ -1289,6 +1290,68 @@ def cmd_timelog(args) -> int:
         return 1
 
 
+def _add_activity_subparser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the 'activity' subcommand."""
+    p = subparsers.add_parser(
+        "activity",
+        help="Report which issues/MRs show local evidence of work on a date (offline)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  activity
+  activity 2026-08-05
+  activity --json
+
+Purely local — no GitLab API, no network, no config. Four evidence
+sources, each reported when it fires (an issue can show up more than
+once): the reflog ('commit:'/'commit (amend):' entries carrying
+'Ref #<N>'); files modified on the date on a branch named
+'<type>/<N>-<slug>' (only consulted when the reflog attributes no
+issue); files under planning/**/issues/<N>-<slug>/ modified on the
+date; and planning/**/reviews/MR<N>-review.yaml modified on the date.
+        """,
+    )
+    p.add_argument(
+        "date",
+        type=str,
+        nargs="?",
+        default=None,
+        metavar="DATE",
+        help="Date to report, YYYY-MM-DD (default: today, local time)",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of a human-readable table",
+    )
+
+
+def cmd_activity(args) -> int:
+    """Handle the 'activity' subcommand.
+
+    Purely local git, so unlike most other subcommands this never touches
+    Config — there is no platform to gate on and no default_group to
+    resolve (see ActivityHandler's module docstring).
+
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        Exit code (0 for success, 1 for error).
+    """
+    try:
+        handler = ActivityHandler()
+        activity_report = handler.report(args.date)
+        if args.json:
+            print(json.dumps(activity_report.to_dict(), indent=2))
+        else:
+            activity_report.print_table()
+        return 0
+    except (PlatformError, ValueError) as err:
+        logger.error("Error: %s", err)
+        return 1
+
+
 def _add_labels_subparser(subparsers: argparse._SubParsersAction) -> None:
     """Register the 'labels' subcommand."""
     subparsers.add_parser(
@@ -1499,6 +1562,8 @@ Examples:
   %(prog)s note epic &70 --body "Closed: different approach."
   %(prog)s timelog 2026-08-05 --to 2026-08-12
   %(prog)s timelog add 478 2h
+  %(prog)s activity
+  %(prog)s activity 2026-08-05 --json
   %(prog)s pipeline-debug
   %(prog)s artifacts --job-id 12345 --path .build-12345/server.stdout
   %(prog)s config
@@ -1528,6 +1593,7 @@ Documentation:
     _add_wiki_subparser(subparsers)
     _add_note_subparser(subparsers)
     _add_timelog_subparser(subparsers)
+    _add_activity_subparser(subparsers)
     _add_labels_subparser(subparsers)
     _add_config_subparser(subparsers)
 
@@ -1557,6 +1623,7 @@ Documentation:
         "wiki": cmd_wiki,
         "note": cmd_note,
         "timelog": cmd_timelog,
+        "activity": cmd_activity,
         "labels": cmd_labels,
         "config": cmd_config,
     }
