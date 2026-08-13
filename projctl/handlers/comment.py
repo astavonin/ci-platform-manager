@@ -345,16 +345,17 @@ def _resolve_discussion(mr_number: int, discussion_id: str, dry_run: bool) -> Op
         print(f"\n[DRY RUN] Would resolve discussion {discussion_id[:12]}")
         return True
 
-    payload = {"resolved": True}
+    # `resolved` goes in the query string, not a JSON body. GitLab accepts the
+    # body form for DiffNote threads but answers 403 for DiscussionNote ones
+    # (a plain comment on the MR rather than one anchored to a diff line), so
+    # the body form silently worked until the first non-diff thread hit it.
     cmd_put = [
         "glab", "api",
-        f"projects/:id/merge_requests/{mr_number}/discussions/{discussion_id}",
+        f"projects/:id/merge_requests/{mr_number}/discussions/{discussion_id}?resolved=true",
         "--method", "PUT",
-        "--header", "Content-Type: application/json",
-        "--input", "-",
     ]
     try:
-        subprocess.run(cmd_put, input=json.dumps(payload), capture_output=True, text=True, check=True)
+        subprocess.run(cmd_put, capture_output=True, text=True, check=True)
         logger.info("✓ Resolved discussion %s", discussion_id[:12])
         return True
     except subprocess.CalledProcessError as err:

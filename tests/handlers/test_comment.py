@@ -746,6 +746,24 @@ class TestResolveDiscussion:
         assert result is True
         assert mock_run.call_count == 2
 
+    @patch(_PATCH_SUBPROCESS)
+    def test_put_sends_resolved_as_a_query_parameter_not_a_json_body(self, mock_run: MagicMock) -> None:
+        """GitLab answers 403 for a DiscussionNote thread when `resolved` is a JSON body.
+
+        It accepts the body form for DiffNote threads, so the wrong shape worked
+        against every diff-anchored thread and only failed on the first plain
+        comment on an MR. Pin the query-string form, which works for both.
+        """
+        mock_run.side_effect = [self._make_get_result(False), MagicMock()]
+
+        _resolve_discussion(self._MR, self._DID, dry_run=False)
+
+        put_args = mock_run.call_args_list[1]
+        cmd = put_args[0][0]
+        assert f"discussions/{self._DID}?resolved=true" in cmd[2]
+        assert "--input" not in cmd, "resolved must not be sent as a JSON body"
+        assert put_args[1].get("input") is None
+
 
 # ---------------------------------------------------------------------------
 # TestResolveDiscussions
