@@ -3,7 +3,7 @@
 import logging
 import subprocess
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 from ..exceptions import PlatformError
 
@@ -34,6 +34,38 @@ def run_cli_command(cli_name: str, cmd: List[str], not_found_msg: str) -> str:
         error_msg = f"Command failed: {' '.join(full_cmd)}\n{err.stderr}"
         logger.error(error_msg)
         raise PlatformError(error_msg) from err
+    except FileNotFoundError as err:
+        logger.error(not_found_msg)
+        raise PlatformError(not_found_msg) from err
+
+
+def run_cli_command_status(
+    cli_name: str, cmd: List[str], not_found_msg: str
+) -> Tuple[int, str, str]:
+    """Run a CLI command and return its exit status alongside both streams.
+
+    Unlike run_cli_command(), a non-zero exit is not an error here — it is a
+    result the caller interprets. Use this when the tool signals a verdict
+    through its exit code and writes the explanation to stdout, as `glab ci
+    lint` does for an invalid configuration.
+
+    Args:
+        cli_name: Name of the CLI binary (e.g. "gh", "glab").
+        cmd: Command arguments to pass after the binary name.
+        not_found_msg: Error message to raise when the binary is not installed.
+
+    Returns:
+        Tuple of (exit code, stdout, stderr), both streams stripped.
+
+    Raises:
+        PlatformError: Only if the binary is not installed.
+    """
+    full_cmd = [cli_name] + cmd
+
+    try:
+        logger.debug("Executing: %s", " ".join(full_cmd))
+        result = subprocess.run(full_cmd, capture_output=True, text=True, check=False)
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
     except FileNotFoundError as err:
         logger.error(not_found_msg)
         raise PlatformError(not_found_msg) from err

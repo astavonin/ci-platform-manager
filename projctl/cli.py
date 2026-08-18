@@ -22,6 +22,7 @@ from .exceptions import PlatformError
 from .handlers.activity import ActivityHandler
 from .handlers.artifacts_handler import ArtifactsHandler
 from .handlers.comment import cmd_comment
+from .handlers.ci_lint import CiLintHandler
 from .handlers.labels import LabelsHandler
 from .handlers.note import NoteHandler
 from .handlers.creator import EpicIssueCreator
@@ -1352,6 +1353,84 @@ def cmd_activity(args) -> int:
         return 1
 
 
+def _add_ci_subparser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the 'ci' subcommand group."""
+    p = subparsers.add_parser(
+        "ci",
+        help="CI configuration operations",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  ci lint
+  ci lint path/to/.gitlab-ci.yml
+  ci lint --dry-run --ref master
+
+Validates against the GitLab server-side linter, which is the only
+authority on CI schema. A file can parse as valid YAML and still be
+rejected:
+
+  script:
+    - echo "Version: $TAG"
+
+parses as a list holding a mapping ({'echo "Version': '$TAG"'}) rather
+than a list of strings, which the schema refuses. A local YAML parse
+sees nothing wrong, so it cannot catch that class of error.
+
+Exit codes: 0 valid, 1 rejected by GitLab, 2 could not be checked.
+Note --dry-run here is glab's flag — it asks GitLab to simulate
+pipeline creation, and does NOT mean "skip API calls" as it does
+elsewhere in projctl.
+        """,
+    )
+    sub = p.add_subparsers(dest="ci_command", required=True, help="CI operations")
+
+    lint_p = sub.add_parser("lint", help="Validate a GitLab CI configuration")
+    lint_p.add_argument(
+        "path",
+        type=str,
+        nargs="?",
+        default=None,
+        metavar="PATH",
+        help="CI file to validate (default: .gitlab-ci.yml)",
+    )
+    lint_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Also simulate pipeline creation, not just schema validation",
+    )
+    lint_p.add_argument(
+        "--ref",
+        type=str,
+        default=None,
+        help="Branch or tag to use as the simulation context (requires --dry-run)",
+    )
+
+
+def cmd_ci(args) -> int:
+    """Handle the 'ci' subcommand.
+
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        Exit code: 0 when the configuration is valid, 1 when GitLab rejects
+        it, 2 when the check could not be performed at all (unusable flags, a
+        missing file, or a glab failure such as an expired token). The last
+        two are kept apart because scripts branch on this value, and "I could
+        not check" must never read as "your configuration is broken".
+    """
+    if args.ci_command != "lint":
+        logger.error("Unknown ci subcommand: %s", args.ci_command)
+        return 2
+
+    try:
+        handler = CiLintHandler(simulate=args.dry_run)
+        return 0 if handler.lint(path=args.path, ref=args.ref) else 1
+    except (PlatformError, ValueError) as err:
+        logger.error("Error: %s", err)
+        return 2
+
+
 def _add_labels_subparser(subparsers: argparse._SubParsersAction) -> None:
     """Register the 'labels' subcommand."""
     subparsers.add_parser(
@@ -1566,6 +1645,7 @@ Examples:
   %(prog)s activity 2026-08-05 --json
   %(prog)s pipeline-debug
   %(prog)s artifacts --job-id 12345 --path .build-12345/server.stdout
+  %(prog)s ci lint
   %(prog)s config
 
 Documentation:
@@ -1594,6 +1674,7 @@ Documentation:
     _add_note_subparser(subparsers)
     _add_timelog_subparser(subparsers)
     _add_activity_subparser(subparsers)
+    _add_ci_subparser(subparsers)
     _add_labels_subparser(subparsers)
     _add_config_subparser(subparsers)
 
@@ -1624,6 +1705,7 @@ Documentation:
         "note": cmd_note,
         "timelog": cmd_timelog,
         "activity": cmd_activity,
+        "ci": cmd_ci,
         "labels": cmd_labels,
         "config": cmd_config,
     }

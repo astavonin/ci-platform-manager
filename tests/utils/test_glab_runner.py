@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 from projctl.utils.glab_runner import (
     run_glab_command,
     run_glab_command_binary,
+    run_glab_command_status,
     stream_glab_command_to_file,
 )
 
@@ -44,6 +45,25 @@ class TestRunGlabCommandBinary:
 
         assert result == payload
         mock_run_binary.assert_called_once_with("glab", ["api", "endpoint"], _NOT_FOUND_MSG)
+
+
+class TestRunGlabCommandStatus:
+    """run_glab_command_status delegates to the status-returning runner."""
+
+    @patch("projctl.utils.glab_runner.run_cli_command_status")
+    def test_delegates_to_status_runner(self, mock_run_status: Mock) -> None:
+        """Routes to run_cli_command_status, not run_cli_command.
+
+        Which runner this wraps is the point: the plain runner raises on a
+        non-zero exit and keeps only stderr, so a delegation slip here turns an
+        invalid-config report into a stack trace with the report discarded.
+        """
+        mock_run_status.return_value = (1, "config is invalid", "")
+
+        result = run_glab_command_status(["ci", "lint"])
+
+        assert result == (1, "config is invalid", "")
+        mock_run_status.assert_called_once_with("glab", ["ci", "lint"], _NOT_FOUND_MSG)
 
 
 class TestStreamGlabCommandToFile:

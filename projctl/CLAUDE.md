@@ -28,6 +28,7 @@ projctl/
 ├── exceptions.py              # PlatformError and custom exceptions
 ├── handlers/                  # Modular operation handlers
 │   ├── artifacts_handler.py   # Download CI job artifacts (GitLab)
+│   ├── ci_lint.py             # Validate CI configuration (GitLab)
 │   ├── comment.py             # Post MR/PR review comments
 │   ├── creator.py             # Create issues/epics/milestones (GitLab)
 │   ├── github_creator.py      # Create issues (GitHub)
@@ -581,6 +582,30 @@ projctl artifacts --job-id 12345 --dest ./out
 - Artifact payloads are binary, so this command uses the binary-safe transport in `utils/glab_runner.py` (`run_glab_command_binary`, `stream_glab_command_to_file`) rather than the shared `text=True` path, which corrupts or raises on non-UTF-8 bytes.
 
 **Handler:** `handlers/artifacts_handler.py` — `ArtifactsHandler` class
+
+### CI Configuration Lint
+
+Validate a GitLab CI configuration against the server-side linter before pushing it. GitLab only.
+
+```bash
+projctl ci lint                             # .gitlab-ci.yml in the current directory
+projctl ci lint path/to/.gitlab-ci.yml      # explicit path
+projctl ci lint --dry-run                   # also simulate pipeline creation
+projctl ci lint --dry-run --ref master      # simulate against a branch or tag
+```
+
+**Behavior notes:**
+- The GitLab server linter is the only authority on CI schema, which is the point of the command: a file can parse as valid YAML and still be rejected. A `script` entry of `- echo "Version: $TAG"` parses as a list holding a *mapping* (`{'echo "Version': '$TAG"'}`) rather than a list of strings, and the schema refuses it — a local YAML parse sees nothing wrong. (The single-line form `script: - echo "..."` is a plain YAML syntax error and is *not* the interesting case; the block form above is.)
+- **Exit codes are a three-way contract**, not a boolean: `0` valid, `1` GitLab rejected the configuration, `2` the check could not be performed at all. `2` covers an unusable flag combination, a missing file, an uninstalled `glab`, and every `glab` failure — expired token, no GitLab remote, API error. Keeping `1` and `2` apart is the point: `glab` itself exits 1 for *both* "invalid config" and "I could not check", so a caller that branches on 1 would report a broken CI file every time a token expired.
+- The verdict is read from a marker on stdout (`is valid` / `is invalid`), not from the exit code alone. Output carrying neither marker raises `PlatformError` regardless of exit status — that is the only signal separating a real verdict from a tool failure, since `glab` prints `Validating...` before it calls the API and so "stdout is non-empty" proves nothing. This also fails **closed** on a `glab` wording change: the drift surfaces as exit 2 rather than silently approving every configuration.
+- The linter's own report (job name, offending key, reason) is printed verbatim on a verdict, and carried in the `PlatformError` message otherwise — stderr included, since that is where every tool failure explains itself.
+- `glab` signals the verdict through its exit code and writes the report to *stdout*, so this command uses `run_glab_command_status` in `utils/glab_runner.py` rather than the shared runner, which raises on a non-zero exit and keeps only stderr — discarding the report.
+- `--ref` is rejected without `--dry-run`. `glab` only applies it during a pipeline simulation and silently ignores it otherwise, which would report a plain static check as if it had been validated against that branch.
+- **`--dry-run` here is `glab`'s flag and inverts projctl's own convention.** Everywhere else in this tool `--dry-run` means "preview, make no API calls"; here it asks GitLab to *additionally* simulate pipeline creation — a heavier server call, not a skipped one. The CLI flag keeps `glab`'s spelling; the handler parameter is named `simulate` so the inversion cannot be mistaken for the usual meaning in code.
+- The path is passed after a `--` separator so a CI file whose name begins with a dash cannot be consumed by `glab` as a flag. Flags are emitted before the separator, since one placed after it would parse as a second positional argument.
+- `glab ci lint` accepts a URL as well as a local path; this command does **not**. The path is checked with `Path.is_file()` first, so a URL is rejected locally with `CI configuration not found`. The precheck is deliberate — it turns a remote round-trip into an immediate local error — but it does narrow what `glab` alone would accept.
+
+**Handler:** `handlers/ci_lint.py` — `CiLintHandler` class
 
 ### Wiki Management
 

@@ -10,6 +10,7 @@ from projctl.exceptions import PlatformError
 from projctl.utils.cli_runner import (
     run_cli_command,
     run_cli_command_binary,
+    run_cli_command_status,
     stream_cli_command_to_file,
 )
 
@@ -64,6 +65,53 @@ class TestRunCliCommandFileNotFound:
 
         with pytest.raises(PlatformError, match="gh is not installed"):
             run_cli_command("gh", ["pr", "list"], not_found_msg)
+
+
+class TestRunCliCommandStatus:
+    """run_cli_command_status reports a non-zero exit as data, not as an error."""
+
+    @patch("subprocess.run")
+    def test_returns_status_and_both_streams_stripped(self, mock_run: Mock) -> None:
+        """Exit code, stdout and stderr all reach the caller, stripped."""
+        mock_run.return_value = Mock(returncode=0, stdout="  ok  ", stderr="  warn  ")
+
+        assert run_cli_command_status("glab", ["ci", "lint"], "glab not found") == (
+            0,
+            "ok",
+            "warn",
+        )
+
+    @patch("subprocess.run")
+    def test_non_zero_exit_returns_instead_of_raising(self, mock_run: Mock) -> None:
+        """A failing command is a verdict here, not an exception.
+
+        This is the whole reason the function exists: run_cli_command() raises
+        on non-zero and keeps only stderr, which would discard the lint report
+        that `glab ci lint` writes to stdout for an invalid configuration.
+        """
+        mock_run.return_value = Mock(returncode=1, stdout="config is invalid", stderr="")
+
+        exit_code, stdout, _ = run_cli_command_status("glab", ["ci", "lint"], "glab not found")
+
+        assert exit_code == 1
+        assert stdout == "config is invalid"
+
+    @patch("subprocess.run")
+    def test_runs_with_check_disabled(self, mock_run: Mock) -> None:
+        """subprocess is invoked with check=False, never check=True."""
+        mock_run.return_value = Mock(returncode=1, stdout="", stderr="")
+
+        run_cli_command_status("glab", ["ci", "lint"], "glab not found")
+
+        assert mock_run.call_args.kwargs["check"] is False
+
+    @patch("subprocess.run")
+    def test_raises_platform_error_when_binary_missing(self, mock_run: Mock) -> None:
+        """A missing binary is a tool failure and still raises."""
+        mock_run.side_effect = FileNotFoundError("No such file or directory: 'glab'")
+
+        with pytest.raises(PlatformError, match="glab not found"):
+            run_cli_command_status("glab", ["ci", "lint"], "glab not found")
 
 
 class TestRunCliCommandBinary:
