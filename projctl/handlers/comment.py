@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from ..utils.glab_runner import discussion_resolve_endpoint
+
 try:
     import yaml
 except ImportError as exc:
@@ -345,13 +347,13 @@ def _resolve_discussion(mr_number: int, discussion_id: str, dry_run: bool) -> Op
         print(f"\n[DRY RUN] Would resolve discussion {discussion_id[:12]}")
         return True
 
-    # `resolved` goes in the query string, not a JSON body. GitLab accepts the
-    # body form for DiffNote threads but answers 403 for DiscussionNote ones
-    # (a plain comment on the MR rather than one anchored to a diff line), so
-    # the body form silently worked until the first non-diff thread hit it.
+    # discussion_resolve_endpoint() owns the query-string-vs-body rule; see its
+    # docstring for why a JSON body 403s on non-diff threads.
     cmd_put = [
         "glab", "api",
-        f"projects/:id/merge_requests/{mr_number}/discussions/{discussion_id}?resolved=true",
+        discussion_resolve_endpoint(
+            f"projects/:id/merge_requests/{mr_number}/discussions", discussion_id
+        ),
         "--method", "PUT",
     ]
     try:

@@ -2,14 +2,13 @@
 
 import json
 import logging
-import shlex
 import urllib.parse
 from typing import List, Optional, Tuple
 
 from ..config import Config
 from ..exceptions import PlatformError
 from ..utils.git_helpers import parse_epic_url, parse_issue_url
-from ..utils.glab_runner import run_glab_command
+from ..utils.glab_runner import DRY_RUN, run_glab_json
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +67,9 @@ class NoteHandler:
                 iid = parts[-1].split("/")[0].split("?")[0].split("#")[0]
                 if not iid or not iid.isdigit():
                     raise ValueError(f"Invalid MR reference in URL: {ref!r}")
-                raw_path = parts[0].split("//", 1)[-1].split("/", 1)[-1] if "//" in parts[0] else None
+                raw_path = (
+                    parts[0].split("//", 1)[-1].split("/", 1)[-1] if "//" in parts[0] else None
+                )
                 if raw_path and "/" not in raw_path:
                     raise ValueError(f"Invalid MR URL format (missing project path): {ref!r}")
                 encoded = urllib.parse.quote(raw_path, safe="") if raw_path else None
@@ -94,15 +95,11 @@ class NoteHandler:
 
         cmd: List[str] = ["api", "-X", "POST", endpoint, "-f", f"body={body}"]
 
-        if self.dry_run:
-            print(f"[dry-run] {shlex.join(['glab', *cmd])}")
+        data = run_glab_json(cmd, dry_run=self.dry_run)
+        if data is DRY_RUN:
             return
-
-        result = run_glab_command(cmd)
-        try:
-            data = json.loads(result)
-        except json.JSONDecodeError as exc:
-            raise PlatformError(f"Unexpected glab response: {result[:200]!r}") from exc
+        if not isinstance(data, dict):
+            raise PlatformError(f"Expected a JSON object from the notes API, got: {data!r}")
         note_id = data.get("id", "?")
         noteable_iid = data.get("noteable_iid") or ""
         logger.debug("Note %s created: noteable_iid=%s", note_id, noteable_iid)
@@ -180,11 +177,9 @@ class NoteHandler:
         """
         encoded_group = urllib.parse.quote(group_path, safe="")
         endpoint = f"groups/{encoded_group}/epics/{iid}"
-        result = run_glab_command(["api", endpoint])
-        try:
-            data = json.loads(result)
-        except json.JSONDecodeError as exc:
-            raise PlatformError(f"Unexpected glab response: {result[:200]!r}") from exc
+        data = run_glab_json(["api", endpoint])
+        if not isinstance(data, dict):
+            raise PlatformError(f"Expected a JSON object for epic {iid}, got: {data!r}")
         work_item_id = data.get("work_item_id")
         if not work_item_id:
             raise PlatformError(
@@ -214,21 +209,17 @@ class NoteHandler:
         # strict superset of GraphQL's string-literal grammar).
         body_literal = json.dumps(body)
         query = (
-            'mutation { createNote(input: { '
+            "mutation { createNote(input: { "
             f'noteableId: "{wi_gid}", body: {body_literal} '
-            '}) { note { id } errors } }'
+            "}) { note { id } errors } }"
         )
         cmd = ["api", "graphql", "-f", f"query={query}"]
 
-        if self.dry_run:
-            print(f"[dry-run] {shlex.join(['glab', *cmd])}")
+        resp = run_glab_json(cmd, dry_run=self.dry_run)
+        if resp is DRY_RUN:
             return
-
-        result = run_glab_command(cmd)
-        try:
-            resp = json.loads(result)
-        except json.JSONDecodeError as exc:
-            raise PlatformError(f"Unexpected glab response: {result[:200]!r}") from exc
+        if not isinstance(resp, dict):
+            raise PlatformError(f"Expected a JSON object from GraphQL, got: {resp!r}")
         payload = resp.get("data", {}).get("createNote", {}) or {}
         errors = payload.get("errors") or []
         if errors:

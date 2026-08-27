@@ -458,6 +458,8 @@ resolve:
 
 `replies:` works on any thread, including an unresolvable top-level comment (GitLab promotes an individual note to a thread on reply). `resolve:` only works on resolvable threads — the ones marked 🔴 or ✅ in the comment listing. An unmarked comment is an individual note and cannot be resolved.
 
+To close threads without posting a review, see **Resolve Discussion Threads** below — `projctl resolve` is also how thread ids are enumerated in the first place.
+
 **`approval` field behaviour:**
 - `approved` (default): calls `glab mr approve` after posting comments. Already-approved MRs are treated as success.
 - `changes_requested`: calls `glab mr unapprove` to revoke any prior approval. MRs with no prior approval are treated as success.
@@ -497,6 +499,53 @@ Reference formats accepted per resource type:
 **Epic transport:** issue and MR notes use the REST `POST /projects/:id/{issues,merge_requests}/:iid/notes` endpoint. Epic notes go via the GraphQL `createNote` mutation against the epic's backing `WorkItem` GID — GitLab 15.9+ has migrated group epics to work items, and the REST group-epic notes endpoint returns 404. The handler resolves the `work_item_id` via a REST GET on the epic first, then posts via GraphQL.
 
 **Handler:** `handlers/note.py` — `NoteHandler` class
+
+### Resolve Discussion Threads
+
+Resolve (close) review discussion threads on a merge request. GitLab only.
+
+```bash
+projctl resolve mr 134 --list
+projctl resolve mr 134 --match "race condition in cache invalidation"
+projctl resolve mr !134 --match "SQL injection" --match "unused parameter"
+projctl resolve mr 134 --discussion a1b2c3d4e5f6 --dry-run
+projctl resolve mr 134 --match "missing unit test" --unresolve
+```
+
+Complements the `resolve:` key of `projctl comment`, which closes threads as part of posting a
+review from a YAML file. This command resolves arbitrary threads without authoring one, and is
+the only way to enumerate thread ids in the first place.
+
+**Selectors.** `--discussion` takes a full id or a unique prefix; `--match` takes a substring
+matched against a thread's *first* note. Both are repeatable and may be mixed. A selector that
+hits zero threads, or more than one, is a hard error naming the candidates — never a silent
+no-op and never a batch resolve. There is deliberately no `--all`: resolving the wrong thread
+silently marks a review finding as handled, so every thread must be named.
+
+**Exit codes.** `0` when every selected thread reached the target state or was already there.
+`1` when an explicitly named thread was not resolvable (a system note or standalone comment), or
+when its API call failed. An already-resolved thread is a genuine no-op and stays `0`.
+
+**Partial failure.** A failing thread does not abort the run — the remaining selectors are still
+attempted and the summary reports `resolved / skipped / failed`, so the record of what already
+changed on the server survives the error.
+
+**`--dry-run` still issues the read.** The discussion list must be fetched to resolve selectors
+to ids, so this command makes one GET even under `--dry-run`; only the PUTs are suppressed. This
+is the same exception `update --remove-blocker` documents, and differs from the tool's usual
+"zero API calls" reading.
+
+**`--list` shows system notes** (`added 1 commit`, `requested review from ...`) as `[n/a ]` rows.
+They are real discussions but carry no resolvable note, so they are listed for completeness and
+rejected as selector targets.
+
+**Request shape:** `resolved` travels in the query string, never a JSON body — GitLab accepts the
+body form for DiffNote threads but answers 403 for DiscussionNote ones. Both this command and
+`comment.py` build the endpoint through `utils/glab_runner.py` → `discussion_resolve_endpoint()`
+so the two cannot drift apart. See `planning/reviews-orphan/main-0e68987/observed-failures.md`
+(2026-08-13 and 2026-08-25).
+
+**Handler:** `handlers/resolve.py` — `ResolveHandler` class
 
 ### Timelog
 

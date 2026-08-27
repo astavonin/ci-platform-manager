@@ -25,6 +25,7 @@ from .handlers.comment import cmd_comment
 from .handlers.ci_lint import CiLintHandler
 from .handlers.labels import LabelsHandler
 from .handlers.note import NoteHandler
+from .handlers.resolve import ResolveHandler
 from .handlers.creator import EpicIssueCreator
 from .handlers.github_creator import GithubIssueCreator
 from .handlers.github_loader import GithubLoader
@@ -1123,6 +1124,100 @@ def cmd_note(args) -> int:
         return 1
 
 
+def _add_resolve_subparser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the 'resolve' subcommand."""
+    p = subparsers.add_parser(
+        "resolve",
+        help="Resolve (close) review discussion threads on a merge request",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  resolve mr 134 --list
+  resolve mr 134 --match "race condition in cache invalidation"
+  resolve mr !134 --match "SQL injection" --match "unused parameter"
+  resolve mr 134 --discussion a1b2c3d4e5f6 --dry-run
+  resolve mr 134 --match "missing unit test" --unresolve
+
+A --match selector must hit exactly one resolvable thread; zero matches or an
+ambiguous match is an error, never a silent no-op or a batch resolve.
+        """,
+    )
+    p.add_argument("resource_type", choices=["mr"], help="Resource type (only 'mr' is resolvable)")
+    p.add_argument(
+        "reference",
+        type=str,
+        help="MR reference (number, !number, or URL)",
+    )
+    p.add_argument(
+        "--list",
+        dest="list_only",
+        action="store_true",
+        help="List discussions with ids and resolution state, then exit",
+    )
+    p.add_argument(
+        "--discussion",
+        action="append",
+        default=[],
+        metavar="ID",
+        help="Discussion id or unique prefix (can be repeated)",
+    )
+    p.add_argument(
+        "--match",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="Substring matched against a thread's first note (can be repeated)",
+    )
+    p.add_argument(
+        "--unresolve",
+        action="store_true",
+        help="Reopen the selected threads instead of resolving them",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Preview without changing anything")
+
+
+def cmd_resolve(args) -> int:
+    """Handle the 'resolve' subcommand.
+
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        Exit code (0 for success, 1 for error).
+    """
+    try:
+        config_path = Path(args.config) if args.config else None
+        config = Config(config_path)
+
+        if config.platform != "gitlab":
+            logger.error("Error: 'resolve' command is only supported for GitLab")
+            return 1
+
+        handler = ResolveHandler(config, dry_run=args.dry_run)
+
+        if args.list_only:
+            # Silently ignoring selectors here would look like a filtered list.
+            if args.discussion or args.match or args.unresolve:
+                logger.error(
+                    "Error: --list cannot be combined with --discussion/--match/--unresolve"
+                )
+                return 1
+            return handler.list_discussions(args.reference)
+
+        return handler.set_resolution(
+            args.reference,
+            args.discussion,
+            args.match,
+            resolved=not args.unresolve,
+        )
+    except FileNotFoundError as err:
+        logger.error(str(err))
+        return 1
+    except (PlatformError, ValueError) as err:
+        logger.error("Error: %s", err)
+        return 1
+
+
 def _add_timelog_subparser(subparsers: argparse._SubParsersAction) -> None:
     """Register the 'timelog' subcommand: report (default) plus the 'add' write form."""
     p = subparsers.add_parser(
@@ -1672,6 +1767,7 @@ Documentation:
     _add_artifacts_subparser(subparsers)
     _add_wiki_subparser(subparsers)
     _add_note_subparser(subparsers)
+    _add_resolve_subparser(subparsers)
     _add_timelog_subparser(subparsers)
     _add_activity_subparser(subparsers)
     _add_ci_subparser(subparsers)
@@ -1703,6 +1799,7 @@ Documentation:
         "artifacts": cmd_artifacts,
         "wiki": cmd_wiki,
         "note": cmd_note,
+        "resolve": cmd_resolve,
         "timelog": cmd_timelog,
         "activity": cmd_activity,
         "ci": cmd_ci,

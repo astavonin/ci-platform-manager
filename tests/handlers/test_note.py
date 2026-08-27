@@ -13,7 +13,9 @@ from projctl.handlers.note import NoteHandler
 # Helpers
 # ---------------------------------------------------------------------------
 
-_PATCH_PATH = "projctl.handlers.note.run_glab_command"
+# Patch the shared runner rather than the handler: note.py now writes through
+# glab_runner.run_glab_json, so this one point covers execute, dry-run, and parse.
+_PATCH_PATH = "projctl.utils.glab_runner.run_glab_command"
 
 
 def _make_handler(dry_run: bool = False) -> NoteHandler:
@@ -773,3 +775,15 @@ class TestAddEpicNote:
         assert "dry-run" in printed
         assert "graphql" in printed
         assert "hello" in printed
+
+
+class TestNullResponseIsNotSuccess:
+    """A JSON null write must not be reported as a posted note."""
+
+    @patch(_PATCH_PATH)
+    def test_null_response_raises_instead_of_printing_success(self, mock_run: MagicMock) -> None:
+        """DRY_RUN, not None, marks a preview — so null stays an error."""
+        mock_run.return_value = "null"
+
+        with pytest.raises(PlatformError):
+            _make_handler().add_mr_note("2", "hi")
