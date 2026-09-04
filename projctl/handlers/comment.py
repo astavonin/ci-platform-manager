@@ -462,11 +462,11 @@ def _run_approve(mr_number: int) -> bool:
     cmd = ["glab", "mr", "approve", str(mr_number)]
     try:
         subprocess.run(cmd, capture_output=True, text=True, check=True)
-        logger.info("✓ Approved MR !%s", mr_number)
+        print(f"✓ Approved MR !{mr_number}")
         return True
     except subprocess.CalledProcessError as err:
         if _is_already_approved_error(err.stderr):
-            logger.info("MR !%s is already approved, treating as success", mr_number)
+            print(f"MR !{mr_number} is already approved, treating as success")
             return True
         logger.error("Failed to approve MR !%s: %s", mr_number, err.stderr)
         return False
@@ -477,11 +477,11 @@ def _run_unapprove(mr_number: int) -> bool:
     cmd = ["glab", "mr", "unapprove", str(mr_number)]
     try:
         subprocess.run(cmd, capture_output=True, text=True, check=True)
-        logger.info("✓ Revoked approval on MR !%s", mr_number)
+        print(f"✓ Revoked approval on MR !{mr_number}")
         return True
     except subprocess.CalledProcessError as err:
         if _is_not_approved_error(err.stderr):
-            logger.info("MR !%s was not approved, nothing to revoke", mr_number)
+            print(f"MR !{mr_number} was not approved, nothing to revoke")
             return True
         logger.error("Failed to revoke approval on MR !%s: %s", mr_number, err.stderr)
         return False
@@ -509,7 +509,7 @@ def _apply_approval_status(mr_number: int, approval: str, dry_run: bool) -> bool
         if dry_run:
             print(f"\n[DRY RUN] Approval status: 'none' — no approval action on MR !{mr_number}")
         else:
-            logger.info("Approval status: 'none' — no approval action for MR !%s", mr_number)
+            print(f"Approval status: 'none' — no approval action on MR !{mr_number}")
         return True
 
     # approval == "approved"
@@ -530,9 +530,11 @@ def _handle_resolve(mr_number: int, resolve_list: list, dry_run: bool) -> int:
             f"{res_skipped} already resolved, {res_failed} failed — MR !{mr_number}"
         )
     else:
-        logger.info(
-            "✓ Resolve: %d resolved, %d skipped, %d failed on MR !%s",
-            res_resolved, res_skipped, res_failed, mr_number,
+        # stdout, not logger.info: the root logger sits at WARNING without --verbose, so an
+        # info-level summary of a completed GitLab mutation would never reach the operator.
+        print(
+            f"✓ Resolve: {res_resolved} resolved, {res_skipped} skipped, "
+            f"{res_failed} failed on MR !{mr_number}"
         )
     return 1 if res_failed else 0
 
@@ -557,12 +559,9 @@ def _post_findings(mr_number: int, review_data: Dict[str, Any], dry_run: bool) -
             f"({skipped_count} already posted, {failed_count} failed) to MR !{mr_number}"
         )
     else:
-        logger.info(
-            "✓ Posted %d inline comments to MR !%s (%d skipped, %d failed)",
-            posted_count,
-            mr_number,
-            skipped_count,
-            failed_count,
+        print(
+            f"✓ Posted {posted_count} inline comments to MR !{mr_number} "
+            f"({skipped_count} skipped, {failed_count} failed)"
         )
     return 1 if failed_count else 0
 
@@ -601,9 +600,9 @@ def cmd_comment(args) -> int:
                     f"{r_skipped} already posted, {r_failed} failed — MR !{mr_number}"
                 )
             else:
-                logger.info(
-                    "✓ Replies: %d posted, %d skipped, %d failed to MR !%s",
-                    r_posted, r_skipped, r_failed, mr_number,
+                print(
+                    f"✓ Replies: {r_posted} posted, {r_skipped} skipped, "
+                    f"{r_failed} failed to MR !{mr_number}"
                 )
             if r_failed:
                 exit_code = 1

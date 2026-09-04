@@ -19,6 +19,7 @@ from projctl.handlers.comment import (
     _load_review_data,
     _parse_diff_lines,
     _parse_hunk_lines,
+    _post_findings,
     _post_inline_findings,
     _resolve_discussion,
     _resolve_discussions,
@@ -898,3 +899,56 @@ class TestLoadReviewDataResolveField:
 
         with pytest.raises(ValueError, match="findings.*replies.*resolve"):
             _load_review_data(str(f))
+
+
+class TestRealRunReportsToStdout:
+    """Outcome reporting must not depend on --verbose.
+
+    The CLI configures the root logger at WARNING unless --verbose is passed, so a summary
+    emitted via logger.info is discarded on an ordinary run. These commands mutate GitLab;
+    a silent success is indistinguishable from a command that did nothing.
+    """
+
+    @patch("projctl.handlers.comment._resolve_discussions", return_value=(2, 0, 0))
+    def test_resolve_summary_reaches_stdout(self, _mock_resolve: MagicMock, capsys) -> None:
+        """A completed resolve run names its counts on stdout."""
+        _handle_resolve(262, [{"discussion_id": "abc"}], dry_run=False)
+
+        out = capsys.readouterr().out
+        assert "2 resolved" in out
+        assert "MR !262" in out
+
+    @patch("projctl.handlers.comment._post_inline_findings", return_value=(18, 0, 0))
+    @patch("projctl.handlers.comment._fetch_mr_position")
+    def test_findings_summary_reaches_stdout(
+        self, mock_position: MagicMock, _mock_post: MagicMock, capsys
+    ) -> None:
+        """A completed inline-findings run names its counts on stdout."""
+        mock_position.return_value = _make_position()
+
+        _post_findings(262, {"findings": [{"title": "x"}]}, dry_run=False)
+
+        out = capsys.readouterr().out
+        assert "18" in out
+        assert "MR !262" in out
+
+    @patch(_PATCH_SUBPROCESS)
+    def test_approval_revoke_reaches_stdout(self, mock_run: MagicMock, capsys) -> None:
+        """changes_requested reports the revoked approval on stdout."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        assert _apply_approval_status(262, "changes_requested", dry_run=False) is True
+        assert "Revoked approval on MR !262" in capsys.readouterr().out
+
+    @patch(_PATCH_SUBPROCESS)
+    def test_approval_approve_reaches_stdout(self, mock_run: MagicMock, capsys) -> None:
+        """approved reports the applied approval on stdout."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        assert _apply_approval_status(262, "approved", dry_run=False) is True
+        assert "Approved MR !262" in capsys.readouterr().out
+
+    def test_approval_none_reaches_stdout(self, capsys) -> None:
+        """The no-action case still says so, rather than exiting silently."""
+        assert _apply_approval_status(262, "none", dry_run=False) is True
+        assert "no approval action" in capsys.readouterr().out
