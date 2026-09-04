@@ -94,6 +94,23 @@ class TestParserWiring:
         assert main(["ci", "lint", "ci/.gitlab-ci.yml"]) == 0
         handler_cls.return_value.lint.assert_called_once_with(path="ci/.gitlab-ci.yml", ref=None)
 
+    def test_run_subcommand_dispatches_to_the_pipeline_trigger(
+        self, handler_cls: Mock
+    ) -> None:
+        """`ci run` must reach cmd_ci_run, not the linter."""
+        with patch("projctl.cli.cmd_ci_run", return_value=0) as mock_run:
+            assert main(["ci", "run", "--branch", "master"]) == 0
+
+        assert mock_run.call_args[0][0].branch == "master"
+        handler_cls.assert_not_called()
+
+    def test_run_exit_code_is_propagated(self, handler_cls: Mock) -> None:
+        """A pipeline that ran and failed exits 1, not 0."""
+        with patch("projctl.cli.cmd_ci_run", return_value=1):
+            assert main(["ci", "run", "--wait"]) == 1
+
+        handler_cls.assert_not_called()
+
     def test_bare_ci_is_rejected_by_the_parser(self, handler_cls: Mock) -> None:
         """`projctl ci` with no subcommand is an argparse usage error.
 

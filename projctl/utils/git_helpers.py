@@ -4,6 +4,8 @@ import subprocess
 from pathlib import Path
 from typing import Optional, Tuple
 
+from ..exceptions import PlatformError
+
 
 def extract_path_from_url(url: str) -> str:
     """Extract the repository/group path from a GitLab URL.
@@ -194,6 +196,30 @@ def get_gitlab_base_url() -> str:
     except (subprocess.CalledProcessError, IndexError):
         pass
     return ""
+
+
+def get_current_branch() -> str:
+    """Get the checked-out branch name.
+
+    Returns:
+        Branch name, or the literal "HEAD" when the checkout is detached.
+        Callers that cannot act on a detached HEAD must reject that value
+        themselves; this helper reports what git reports.
+
+    Raises:
+        PlatformError: If git fails or is not installed.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as err:
+        detail = getattr(err, "stderr", None) or err
+        raise PlatformError(f"Failed to get current branch: {detail}") from err
+    return result.stdout.strip()
 
 
 def get_current_repo_path() -> Optional[str]:

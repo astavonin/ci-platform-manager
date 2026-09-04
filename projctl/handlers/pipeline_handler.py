@@ -2,13 +2,12 @@
 
 import json
 import logging
-import subprocess
 import urllib.parse
 from typing import Any, Dict, List, Optional
 
 from ..config import Config
 from ..exceptions import PlatformError
-from ..utils.git_helpers import get_current_repo_path
+from ..utils.git_helpers import get_current_branch, get_current_repo_path
 from ..utils.glab_runner import run_glab_command
 
 logger = logging.getLogger(__name__)
@@ -40,19 +39,12 @@ class PipelineHandler:
             PlatformError: If git command fails.
         """
         try:
-            result = subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            branch = result.stdout.strip()
-            logger.debug("Current branch: %s", branch)
-            return branch
-        except subprocess.CalledProcessError as err:
-            error_msg = f"Failed to get current branch: {err.stderr}"
-            logger.error(error_msg)
-            raise PlatformError(error_msg) from err
+            branch = get_current_branch()
+        except PlatformError as err:
+            logger.error(str(err))
+            raise
+        logger.debug("Current branch: %s", branch)
+        return branch
 
     def get_project_id(self) -> str:
         """Get project ID (cached).

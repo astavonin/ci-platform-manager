@@ -23,8 +23,10 @@ from .handlers.activity import ActivityHandler
 from .handlers.artifacts_handler import ArtifactsHandler
 from .handlers.comment import cmd_comment
 from .handlers.ci_lint import CiLintHandler
+from .handlers.ci_run import cmd_ci_run
 from .handlers.labels import LabelsHandler
 from .handlers.note import NoteHandler
+from .handlers.merge import cmd_merge
 from .handlers.resolve import ResolveHandler
 from .handlers.creator import EpicIssueCreator
 from .handlers.github_creator import GithubIssueCreator
@@ -1124,6 +1126,70 @@ def cmd_note(args) -> int:
         return 1
 
 
+def _add_merge_subparser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the 'merge' subcommand."""
+    p = subparsers.add_parser(
+        "merge",
+        help="Merge one merge request, or a stacked chain in order",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  merge 264
+  merge 264 --dry-run
+  merge 264 263 265 266            # stacked chain, base first
+  merge 266 --allow-failed-pipeline
+  merge 264 263 --keep-branch --squash
+
+Every MR is gated before merging: it must be opened, not a draft, mergeable,
+free of unresolved threads, and its head pipeline must have succeeded. The last
+two gates can be waived with --allow-unresolved / --allow-failed-pipeline.
+
+For a chain, MRs merge in the order given, and a next MR that targets the branch
+just merged is gated only after GitLab retargets it. Any blockage stops the run
+rather than merging the rest into the wrong base.
+
+--dry-run does not stop early: nothing is being merged, so it reports every gate
+for every MR at once. A pipeline whose only failures carry allow_failure reports
+'success' and passes the gate; those jobs are listed as 'masked' so a green
+rollup is not mistaken for a green run.
+        """,
+    )
+    p.add_argument(
+        "mr",
+        nargs="+",
+        metavar="MR",
+        help="MR reference(s) (number, !number, or URL), base first for a chain",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report every gate for every MR without merging; exits 0 only if all can merge"
+    )
+    p.add_argument(
+        "--allow-unresolved", action="store_true", help="Merge despite unresolved threads"
+    )
+    p.add_argument(
+        "--allow-failed-pipeline",
+        action="store_true",
+        help="Merge even when the head pipeline did not succeed",
+    )
+    p.add_argument(
+        "--keep-branch", action="store_true", help="Keep the source branch after merging"
+    )
+    p.add_argument("--squash", action="store_true", help="Squash commits when merging")
+    p.add_argument(
+        "--wait",
+        action="store_true",
+        help="Wait for a running pipeline to finish before gating, instead of refusing",
+    )
+    p.add_argument(
+        "--rebase",
+        action="store_true",
+        help="Rebase each remaining MR after its parent merges, and wait for its "
+        "pipeline (required for a stacked chain on a fast-forward-only project)",
+    )
+
+
 def _add_resolve_subparser(subparsers: argparse._SubParsersAction) -> None:
     """Register the 'resolve' subcommand."""
     p = subparsers.add_parser(
@@ -1174,6 +1240,25 @@ ambiguous match is an error, never a silent no-op or a batch resolve.
         help="Reopen the selected threads instead of resolving them",
     )
     p.add_argument("--dry-run", action="store_true", help="Preview without changing anything")
+
+
+def cmd_merge_dispatch(args) -> int:
+    """Handle the 'merge' subcommand.
+
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        Exit code (0 for success, 1 for error).
+    """
+    config_path = Path(args.config) if args.config else None
+    config = Config(config_path)
+
+    if config.platform != "gitlab":
+        logger.error("Error: 'merge' command is only supported for GitLab")
+        return 1
+
+    return cmd_merge(args, config)
 
 
 def cmd_resolve(args) -> int:
@@ -1459,8 +1544,11 @@ Examples:
   ci lint
   ci lint path/to/.gitlab-ci.yml
   ci lint --dry-run --ref master
+  ci run
+  ci run --branch feature/my-branch
+  ci run --branch master --variable RUN_SLOW_TESTS=true --wait
 
-Validates against the GitLab server-side linter, which is the only
+lint validates against the GitLab server-side linter, which is the only
 authority on CI schema. A file can parse as valid YAML and still be
 rejected:
 
@@ -1471,10 +1559,16 @@ parses as a list holding a mapping ({'echo "Version': '$TAG"'}) rather
 than a list of strings, which the schema refuses. A local YAML parse
 sees nothing wrong, so it cannot catch that class of error.
 
-Exit codes: 0 valid, 1 rejected by GitLab, 2 could not be checked.
-Note --dry-run here is glab's flag — it asks GitLab to simulate
+lint exit codes: 0 valid, 1 rejected by GitLab, 2 could not be checked.
+Note lint's --dry-run is glab's flag — it asks GitLab to simulate
 pipeline creation, and does NOT mean "skip API calls" as it does
 elsewhere in projctl.
+
+run creates a pipeline and, with --wait, polls it to a terminal status.
+Its exit codes are 0 created (and succeeded, under --wait), 1 created
+but did not succeed, 2 could not be created at all. Its --dry-run is
+projctl's usual one: report the pipeline that would be created and make
+no API call.
         """,
     )
     sub = p.add_subparsers(dest="ci_command", required=True, help="CI operations")
@@ -1500,6 +1594,31 @@ elsewhere in projctl.
         help="Branch or tag to use as the simulation context (requires --dry-run)",
     )
 
+    run_p = sub.add_parser("run", help="Create a pipeline for a branch")
+    run_p.add_argument(
+        "--branch",
+        type=str,
+        default=None,
+        help="Branch or tag to run against (default: the checked-out branch)",
+    )
+    run_p.add_argument(
+        "--variable",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Pipeline variable (can be repeated)",
+    )
+    run_p.add_argument(
+        "--wait",
+        action="store_true",
+        help="Poll until the pipeline reaches a terminal status; exit 1 unless it succeeded",
+    )
+    run_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report the pipeline that would be created, without creating it",
+    )
+
 
 def cmd_ci(args) -> int:
     """Handle the 'ci' subcommand.
@@ -1514,6 +1633,9 @@ def cmd_ci(args) -> int:
         two are kept apart because scripts branch on this value, and "I could
         not check" must never read as "your configuration is broken".
     """
+    if args.ci_command == "run":
+        return cmd_ci_run(args)
+
     if args.ci_command != "lint":
         logger.error("Unknown ci subcommand: %s", args.ci_command)
         return 2
@@ -1767,6 +1889,7 @@ Documentation:
     _add_artifacts_subparser(subparsers)
     _add_wiki_subparser(subparsers)
     _add_note_subparser(subparsers)
+    _add_merge_subparser(subparsers)
     _add_resolve_subparser(subparsers)
     _add_timelog_subparser(subparsers)
     _add_activity_subparser(subparsers)
@@ -1799,6 +1922,7 @@ Documentation:
         "artifacts": cmd_artifacts,
         "wiki": cmd_wiki,
         "note": cmd_note,
+        "merge": cmd_merge_dispatch,
         "resolve": cmd_resolve,
         "timelog": cmd_timelog,
         "activity": cmd_activity,

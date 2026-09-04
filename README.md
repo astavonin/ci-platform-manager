@@ -17,13 +17,13 @@ Create issues and epics from YAML files that mirror the shape of the planning ar
 
 ### MR workflow
 
-The `comment` command is the bridge between a `code-review.md` artifact and the actual merge request: it posts inline diff comments per finding, replies to and resolves discussion threads, and issues approve or unapprove — all from a single YAML file. `create-mr` opens the MR itself with template enforcement, so required sections and default reviewers are applied consistently across every submission.
+The `comment` command is the bridge between a `code-review.md` artifact and the actual merge request: it posts inline diff comments per finding, replies to and resolves discussion threads, and issues approve or unapprove — all from a single YAML file. `create-mr` opens the MR itself with template enforcement, so required sections and default reviewers are applied consistently across every submission. `merge` closes the loop: it gates each MR on state, draft status, mergeability, unresolved threads, and its head pipeline before merging, and can land a stacked chain in order — waiting for GitLab to retarget each remaining MR, and rebasing them where the project is fast-forward only.
 
 ### Planning sync
 
 `projctl sync` rsyncs the local `./planning/` folder to Google Drive with drift detection: `sync status` reports `in-sync`, `local-ahead`, `remote-ahead`, or `diverged` before any files move, so switching machines starts from a known state. This is what keeps the workflow's persistent context alive across session resets — pull before starting work, push when finishing, and the same planning tree is available on the next machine.
 
-Utilities cover GitLab wiki management, CI pipeline failure log retrieval, `ci lint` — validating a `.gitlab-ci.yml` against the GitLab server-side linter before pushing it, which catches schema errors a local YAML parse cannot — label inspection, configuration introspection, and `timelog`, a report of your own logged time by day and issue, plus `timelog add` to log new time against an issue or MR.
+Utilities cover GitLab wiki management, CI pipeline failure log retrieval, `ci lint` — validating a `.gitlab-ci.yml` against the GitLab server-side linter before pushing it, which catches schema errors a local YAML parse cannot — `ci run` to trigger a pipeline for a branch and optionally wait on it, label inspection, configuration introspection, and `timelog`, a report of your own logged time by day and issue, plus `timelog add` to log new time against an issue or MR.
 
 ## Relationship to genai-automations
 

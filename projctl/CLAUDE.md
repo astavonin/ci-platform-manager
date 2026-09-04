@@ -29,6 +29,7 @@ projctl/
 ├── handlers/                  # Modular operation handlers
 │   ├── artifacts_handler.py   # Download CI job artifacts (GitLab)
 │   ├── ci_lint.py             # Validate CI configuration (GitLab)
+│   ├── ci_run.py              # Create and await a pipeline (GitLab)
 │   ├── comment.py             # Post MR/PR review comments
 │   ├── creator.py             # Create issues/epics/milestones (GitLab)
 │   ├── github_creator.py      # Create issues (GitHub)
@@ -38,6 +39,7 @@ projctl/
 │   ├── github_updater.py      # Update issues/PRs (GitHub)
 │   ├── labels.py              # Display configured labels
 │   ├── loader.py              # Load issues/epics/milestones/MRs (GitLab)
+│   ├── merge.py               # Merge MRs, single or stacked chain (GitLab)
 │   ├── mr_handler.py          # Create merge requests (GitLab)
 │   ├── pipeline_handler.py    # Debug failed pipeline jobs (GitLab)
 │   ├── search.py              # Search operations (GitLab)
@@ -479,6 +481,39 @@ projctl create-mr --dry-run
 
 Platform dispatch: uses `gh pr create` for GitHub, `glab mr create` for GitLab, based on `config.platform`.
 
+### Merge
+
+Merge one merge request, or a stacked chain in order. GitLab only.
+
+```bash
+projctl merge 264
+projctl merge 264 --dry-run
+projctl merge 264 263 265                  # stacked chain, base first
+projctl merge 264 --allow-failed-pipeline
+projctl merge 264 --keep-branch --squash
+projctl merge 264 263 --rebase             # fast-forward-only project
+```
+
+**Gates.** Every MR is checked before the merge call: it must be opened, not a draft, mergeable, free of unresolved threads, and its head pipeline must have succeeded. A missing pipeline passes — docs-only branches and projects without CI legitimately have none. Only the last two gates are waivable, with `--allow-unresolved` and `--allow-failed-pipeline`.
+
+**`detailed_merge_status` is the authority, not `merge_status`.** The legacy field reports `can_be_merged` for an MR GitLab then refuses with HTTP 405 — `ci_must_pass` after a retarget is the case that bites, because the old pipeline ran against the old target. Values meaning "ask again shortly" (`checking`, `unchecked`, `preparing`, `ci_still_running`) are polled rather than treated as a refusal, since a retarget passes through several of them before settling.
+
+**Chains stop at the first blockage.** Every later MR in a stack targets a branch the blocked one was supposed to move, so continuing would either fail the same way or merge into the wrong base. The summary reports how many of the chain merged.
+
+**Retargeting is waited for, not assumed.** GitLab retargets a child MR onto the grandparent when its target MR merges, and that write is asynchronous — gating the child immediately would evaluate it against a branch that no longer exists. Only a child that actually targets the just-merged branch is waited for; independent MRs merged in the same run never move and are not reported as retargeted.
+
+**`--rebase` is required for a stacked chain on a fast-forward-only project.** Under `merge_method: ff` the branch must be a direct descendant of its target, and a squashing project rewrites each merged commit — so a stacked MR stops being a descendant the moment its parent lands, while GitLab still reports `mergeable` and then refuses the PUT with 422. The flag rebases each remaining MR after its parent merges and waits for the new pipeline, since the rebase gives the branch a new SHA.
+
+**A merge rejected with 405/422 while the MR reports itself mergeable is retried.** Immediately after a retarget GitLab can report `mergeable` and still refuse; the same MR merges cleanly seconds later untouched. Each retry re-runs the gates first, so a refusal that is real surfaces by name instead of looping.
+
+**`--dry-run` does not stop early.** Nothing is being merged, so it reports every gate for every MR at once. It also lists jobs that failed under `allow_failure` as `masked` — such a pipeline reports `success` and passes the gate, so a green rollup is shown for what it is rather than silently trusted.
+
+**Polls tolerate a transient network error.** A pipeline wait runs for tens of minutes; a single unreachable poll is logged and retried within the loop's own budget rather than aborting a merge that is otherwise on track.
+
+**Exit codes:** `0` when every named MR merged (or, under `--dry-run`, when every one of them could), `1` on any blockage, failure, or malformed reference.
+
+**Handler:** `handlers/merge.py` — `MergeHandler` class
+
 ### Notes (Comments)
 
 Post a note (comment) to a GitLab issue, MR, or epic. GitLab only.
@@ -655,6 +690,26 @@ projctl ci lint --dry-run --ref master      # simulate against a branch or tag
 - `glab ci lint` accepts a URL as well as a local path; this command does **not**. The path is checked with `Path.is_file()` first, so a URL is rejected locally with `CI configuration not found`. The precheck is deliberate — it turns a remote round-trip into an immediate local error — but it does narrow what `glab` alone would accept.
 
 **Handler:** `handlers/ci_lint.py` — `CiLintHandler` class
+
+### CI Pipeline Run
+
+Create a pipeline for a branch, optionally waiting for it to finish. GitLab only.
+
+```bash
+projctl ci run                                          # the checked-out branch
+projctl ci run --branch master
+projctl ci run --variable RUN_SLOW_TESTS=true --wait
+projctl ci run --branch master --dry-run
+```
+
+**Behavior notes:**
+- **Exit codes are a three-way contract**, matching `ci lint`'s reasoning but with different meanings: `0` the pipeline was created (and succeeded, under `--wait`), `1` it was created but did not succeed, `2` it could not be created at all. A caller that collapses 1 and 2 would report a failing build every time a token expired.
+- **`--dry-run` here is projctl's usual one**, unlike `ci lint`'s: it reports the pipeline that would be created and makes no API call. The two `--dry-run` flags under `ci` deliberately differ because `lint`'s is `glab`'s own flag.
+- The default ref is the checked-out branch, read via `utils/git_helpers.py` → `get_current_branch()`. A detached HEAD is a hard error naming `--branch`, since there is no branch to run against.
+- A malformed `--variable` is rejected before the API call. Silently dropping one would produce a pipeline that looks right and behaves differently.
+- `--wait` polls for up to an hour (240 × 15s) and returns the status GitLab reports. `manual` and `skipped` count as terminal — the pipeline will not change without another event — and only `success` exits 0. A pipeline that finished green solely because every failed job carried `allow_failure` still reports `success`; use `merge --dry-run`, which lists those jobs as `masked`, when that distinction matters.
+
+**Handler:** `handlers/ci_run.py` — `CiRunHandler` class
 
 ### Wiki Management
 
